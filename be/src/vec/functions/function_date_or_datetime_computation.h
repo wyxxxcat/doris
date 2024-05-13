@@ -146,18 +146,13 @@ ADD_TIME_FUNCTION_IMPL(AddYearsImpl, years_add, YEAR);
 
 template <typename DateType>
 struct AddQuartersImpl {
-    using ReturnType =
-            std::conditional_t<std::is_same_v<DateType, DataTypeDate> ||
-                                       std::is_same_v<DateType, DataTypeDateTime>,
-                               DataTypeDateTime,
-                               std::conditional_t<std::is_same_v<DateType, DataTypeDateV2>,
-                                                  DataTypeDateV2, DataTypeDateTimeV2>>;
-    using InputNativeType = std::conditional_t<
-            std::is_same_v<DateType, DataTypeDate> || std::is_same_v<DateType, DataTypeDateTime>,
-            Int64, std::conditional_t<std::is_same_v<DateType, DataTypeDateV2>, UInt32, UInt64>>;
-    using ReturnNativeType = std::conditional_t<
-            std::is_same_v<DateType, DataTypeDate> || std::is_same_v<DateType, DataTypeDateTime>,
-            Int64, std::conditional_t<std::is_same_v<DateType, DataTypeDateV2>, UInt32, UInt64>>;
+    constexpr static bool is_v1 = date_cast::IsV1<DateType>();
+    using ReturnType = std::conditional_t<is_v1, DataTypeDateTime, DateType>;
+    using ReturnDateType = std::conditional_t<is_v1, DataTypeDateTime, DateType>;
+    using ReturnDateValueType = date_cast::TypeToValueTypeV<ReturnDateType>;
+    using ReturnColumnType = date_cast::TypeToColumnV<ReturnDateType>;
+    using InputNativeType = date_cast::ValueTypeOfColumnV<ReturnColumnType>;
+    using ReturnNativeType = date_cast::ValueTypeOfColumnV<ReturnColumnType>;
     static constexpr auto name = "quarters_add";
     static constexpr auto is_nullable = true;
     static inline ReturnNativeType execute(const InputNativeType& t, Int64 delta, bool& is_null) {
@@ -242,36 +237,30 @@ struct SubtractYearsImpl : SubtractIntervalImpl<AddYearsImpl<DateType>, DateType
     static constexpr auto name = "years_sub";
 };
 
-#define DECLARE_DATE_FUNCTIONS(NAME, FN_NAME, RETURN_TYPE, STMT)                                   \
-    template <typename DateType1, typename DateType2>                                              \
-    struct NAME {                                                                                  \
-        using ArgType1 = std::conditional_t<                                                       \
-                std::is_same_v<DateType1, DataTypeDateV2>, UInt32,                                 \
-                std::conditional_t<std::is_same_v<DateType1, DataTypeDateTimeV2>, UInt64, Int64>>; \
-        using ArgType2 = std::conditional_t<                                                       \
-                std::is_same_v<DateType2, DataTypeDateV2>, UInt32,                                 \
-                std::conditional_t<std::is_same_v<DateType2, DataTypeDateTimeV2>, UInt64, Int64>>; \
-        using DateValueType1 = std::conditional_t<                                                 \
-                std::is_same_v<DateType1, DataTypeDateV2>, DateV2Value<DateV2ValueType>,           \
-                std::conditional_t<std::is_same_v<DateType1, DataTypeDateTimeV2>,                  \
-                                   DateV2Value<DateTimeV2ValueType>, VecDateTimeValue>>;           \
-        using DateValueType2 = std::conditional_t<                                                 \
-                std::is_same_v<DateType2, DataTypeDateV2>, DateV2Value<DateV2ValueType>,           \
-                std::conditional_t<std::is_same_v<DateType2, DataTypeDateTimeV2>,                  \
-                                   DateV2Value<DateTimeV2ValueType>, VecDateTimeValue>>;           \
-        using ReturnType = RETURN_TYPE;                                                            \
-        static constexpr auto name = #FN_NAME;                                                     \
-        static constexpr auto is_nullable = false;                                                 \
-        static inline ReturnType::FieldType execute(const ArgType1& t0, const ArgType2& t1,        \
-                                                    bool& is_null) {                               \
-            const auto& ts0 = reinterpret_cast<const DateValueType1&>(t0);                         \
-            const auto& ts1 = reinterpret_cast<const DateValueType2&>(t1);                         \
-            is_null = !ts0.is_valid_date() || !ts1.is_valid_date();                                \
-            return STMT;                                                                           \
-        }                                                                                          \
-        static DataTypes get_variadic_argument_types() {                                           \
-            return {std::make_shared<DateType1>(), std::make_shared<DateType2>()};                 \
-        }                                                                                          \
+#define DECLARE_DATE_FUNCTIONS(NAME, FN_NAME, RETURN_TYPE, STMT)                             \
+    template <typename DateType1, typename DateType2>                                        \
+    struct NAME {                                                                            \
+        using ArgType1 = date_cast::ValueTypeOfColumnV<date_cast::TypeToColumnV<DateType1>>; \
+                                                                                             \
+        using ArgType2 = date_cast::ValueTypeOfColumnV<date_cast::TypeToColumnV<DateType2>>; \
+                                                                                             \
+        using DateValueType1 = date_cast::TypeToValueTypeV<DateType1>;                       \
+                                                                                             \
+        using DateValueType2 = date_cast::TypeToValueTypeV<DateType1>;                       \
+                                                                                             \
+        using ReturnType = RETURN_TYPE;                                                      \
+        static constexpr auto name = #FN_NAME;                                               \
+        static constexpr auto is_nullable = false;                                           \
+        static inline ReturnType::FieldType execute(const ArgType1& t0, const ArgType2& t1,  \
+                                                    bool& is_null) {                         \
+            const auto& ts0 = reinterpret_cast<const DateValueType1&>(t0);                   \
+            const auto& ts1 = reinterpret_cast<const DateValueType2&>(t1);                   \
+            is_null = !ts0.is_valid_date() || !ts1.is_valid_date();                          \
+            return STMT;                                                                     \
+        }                                                                                    \
+        static DataTypes get_variadic_argument_types() {                                     \
+            return {std::make_shared<DateType1>(), std::make_shared<DateType2>()};           \
+        }                                                                                    \
     };
 DECLARE_DATE_FUNCTIONS(DateDiffImpl, datediff, DataTypeInt32, (ts0.daynr() - ts1.daynr()));
 // DECLARE_DATE_FUNCTIONS(TimeDiffImpl, timediff, DataTypeTime, ts0.second_diff(ts1));
@@ -326,29 +315,26 @@ TIME_DIFF_FUNCTION_IMPL(MintueSDiffImpl, minutes_diff, MINUTE);
 TIME_DIFF_FUNCTION_IMPL(SecondsDiffImpl, seconds_diff, SECOND);
 TIME_DIFF_FUNCTION_IMPL(MilliSecondsDiffImpl, milliseconds_diff, MILLISECOND);
 TIME_DIFF_FUNCTION_IMPL(MicroSecondsDiffImpl, microseconds_diff, MICROSECOND);
-
-#define TIME_FUNCTION_TWO_ARGS_IMPL(CLASS, NAME, FUNCTION, RETURN_TYPE)                           \
-    template <typename DateType>                                                                  \
-    struct CLASS {                                                                                \
-        using ArgType = std::conditional_t<                                                       \
-                std::is_same_v<DateType, DataTypeDateV2>, UInt32,                                 \
-                std::conditional_t<std::is_same_v<DateType, DataTypeDateTimeV2>, UInt64, Int64>>; \
-        using DateValueType = std::conditional_t<                                                 \
-                std::is_same_v<DateType, DataTypeDateV2>, DateV2Value<DateV2ValueType>,           \
-                std::conditional_t<std::is_same_v<DateType, DataTypeDateTimeV2>,                  \
-                                   DateV2Value<DateTimeV2ValueType>, VecDateTimeValue>>;          \
-        using ReturnType = RETURN_TYPE;                                                           \
-        static constexpr auto name = #NAME;                                                       \
-        static constexpr auto is_nullable = false;                                                \
-        static inline ReturnType::FieldType execute(const ArgType& t0, const Int32 mode,          \
-                                                    bool& is_null) {                              \
-            const auto& ts0 = reinterpret_cast<const DateValueType&>(t0);                         \
-            is_null = !ts0.is_valid_date();                                                       \
-            return ts0.FUNCTION;                                                                  \
-        }                                                                                         \
-        static DataTypes get_variadic_argument_types() {                                          \
-            return {std::make_shared<DateType>(), std::make_shared<DataTypeInt32>()};             \
-        }                                                                                         \
+//todo
+#define TIME_FUNCTION_TWO_ARGS_IMPL(CLASS, NAME, FUNCTION, RETURN_TYPE)                    \
+    template <typename DateType>                                                           \
+    struct CLASS {                                                                         \
+        using ArgType = date_cast::ValueTypeOfColumnV<date_cast::TypeToColumnV<DateType>>; \
+                                                                                           \
+        using DateValueType = date_cast::TypeToValueTypeV<DateType>;                       \
+                                                                                           \
+        using ReturnType = RETURN_TYPE;                                                    \
+        static constexpr auto name = #NAME;                                                \
+        static constexpr auto is_nullable = false;                                         \
+        static inline ReturnType::FieldType execute(const ArgType& t0, const Int32 mode,   \
+                                                    bool& is_null) {                       \
+            const auto& ts0 = reinterpret_cast<const DateValueType&>(t0);                  \
+            is_null = !ts0.is_valid_date();                                                \
+            return ts0.FUNCTION;                                                           \
+        }                                                                                  \
+        static DataTypes get_variadic_argument_types() {                                   \
+            return {std::make_shared<DateType>(), std::make_shared<DataTypeInt32>()};      \
+        }                                                                                  \
     }
 
 TIME_FUNCTION_TWO_ARGS_IMPL(ToYearWeekTwoArgsImpl, yearweek, year_week(mysql_week_mode(mode)),

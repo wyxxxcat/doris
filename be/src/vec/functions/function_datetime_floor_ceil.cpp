@@ -27,6 +27,7 @@
 
 #include "common/status.h"
 #include "util/binary_cast.hpp"
+#include "util/datetype_cast.hpp"
 #include "vec/aggregate_functions/aggregate_function.h"
 #include "vec/columns/column.h"
 #include "vec/columns/column_const.h"
@@ -70,7 +71,7 @@ struct YearFloor;
 } // namespace doris
 
 namespace doris::vectorized {
-
+//todo
 template <typename Impl, typename DateValueType, typename DeltaValueType, int ArgNum, bool UseDelta>
 class FunctionDateTimeFloorCeil : public IFunction {
 public:
@@ -101,35 +102,32 @@ public:
     DataTypes get_variadic_argument_types_impl() const override {
         if constexpr (std::is_same_v<DateValueType, VecDateTimeValue> && ArgNum == 1) {
             return {std::make_shared<DataTypeDateTime>()};
-        } else if constexpr (std::is_same_v<DateValueType, DateV2Value<DateV2ValueType>> &&
-                             ArgNum == 1) {
+        } else if constexpr (std::is_same_v<DateValueType, DataTypeDateV2> && ArgNum == 1) {
             return {std::make_shared<DataTypeDateV2>()};
-        } else if constexpr (std::is_same_v<DateValueType, DateV2Value<DateTimeV2ValueType>> &&
-                             ArgNum == 1) {
+        } else if constexpr (std::is_same_v<DateValueType, DataTypeDateTimeV2> && ArgNum == 1) {
             return {std::make_shared<DataTypeDateTimeV2>()};
         } else if constexpr (std::is_same_v<DateValueType, VecDateTimeValue> && ArgNum == 2 &&
                              UseDelta) {
             return {std::make_shared<DataTypeDateTime>(), std::make_shared<DeltaDataType>()};
-        } else if constexpr (std::is_same_v<DateValueType, DateV2Value<DateV2ValueType>> &&
-                             ArgNum == 2 && UseDelta) {
+        } else if constexpr (std::is_same_v<DateValueType, DataTypeDateV2> && ArgNum == 2 &&
+                             UseDelta) {
             return {std::make_shared<DataTypeDateV2>(), std::make_shared<DeltaDataType>()};
-        } else if constexpr (std::is_same_v<DateValueType, DateV2Value<DateTimeV2ValueType>> &&
-                             ArgNum == 2 && UseDelta) {
+        } else if constexpr (std::is_same_v<DateValueType, DataTypeDateTimeV2> && ArgNum == 2 &&
+                             UseDelta) {
             return {std::make_shared<DataTypeDateTimeV2>(), std::make_shared<DeltaDataType>()};
         } else if constexpr (std::is_same_v<DateValueType, VecDateTimeValue> && ArgNum == 2 &&
                              !UseDelta) {
             return {std::make_shared<DataTypeDateTime>(), std::make_shared<DataTypeDateTime>()};
-        } else if constexpr (std::is_same_v<DateValueType, DateV2Value<DateV2ValueType>> &&
-                             ArgNum == 2 && !UseDelta) {
+        } else if constexpr (std::is_same_v<DateValueType, DataTypeDateV2> && ArgNum == 2 &&
+                             !UseDelta) {
             return {std::make_shared<DataTypeDateV2>(), std::make_shared<DataTypeDateV2>()};
-        } else if constexpr (std::is_same_v<DateValueType, DateV2Value<DateTimeV2ValueType>> &&
-                             ArgNum == 2 && !UseDelta) {
+        } else if constexpr (std::is_same_v<DateValueType, DataTypeDateTimeV2> && ArgNum == 2 &&
+                             !UseDelta) {
             return {std::make_shared<DataTypeDateTimeV2>(), std::make_shared<DataTypeDateTimeV2>()};
         } else if constexpr (std::is_same_v<DateValueType, VecDateTimeValue> && ArgNum == 3) {
             return {std::make_shared<DataTypeDateTime>(), std::make_shared<DeltaDataType>(),
                     std::make_shared<DataTypeDateTime>()};
-        } else if constexpr (std::is_same_v<DateValueType, DateV2Value<DateV2ValueType>> &&
-                             ArgNum == 3) {
+        } else if constexpr (std::is_same_v<DateValueType, DataTypeDateV2> && ArgNum == 3) {
             return {std::make_shared<DataTypeDateV2>(), std::make_shared<DeltaDataType>(),
                     std::make_shared<DataTypeDateV2>()};
         } else {
