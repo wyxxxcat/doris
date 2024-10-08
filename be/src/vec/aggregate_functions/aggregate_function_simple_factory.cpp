@@ -56,6 +56,7 @@ void register_aggregate_function_percentile(AggregateFunctionSimpleFactory& fact
 void register_aggregate_function_percentile_old(AggregateFunctionSimpleFactory& factory);
 void register_aggregate_function_window_funnel(AggregateFunctionSimpleFactory& factory);
 void register_aggregate_function_window_funnel_old(AggregateFunctionSimpleFactory& factory);
+void register_aggregate_function_regr_union(AggregateFunctionSimpleFactory& factory);
 void register_aggregate_function_retention(AggregateFunctionSimpleFactory& factory);
 void register_aggregate_function_regr_mixed(AggregateFunctionSimpleFactory& factory);
 void register_aggregate_function_percentile_approx(AggregateFunctionSimpleFactory& factory);
@@ -69,6 +70,8 @@ void register_aggregate_function_bitmap_agg(AggregateFunctionSimpleFactory& fact
 void register_aggregate_functions_corr(AggregateFunctionSimpleFactory& factory);
 void register_aggregate_function_covar_pop(AggregateFunctionSimpleFactory& factory);
 void register_aggregate_function_covar_samp(AggregateFunctionSimpleFactory& factory);
+void register_aggregate_function_skewness(AggregateFunctionSimpleFactory& factory);
+void register_aggregate_function_kurtosis(AggregateFunctionSimpleFactory& factory);
 
 AggregateFunctionSimpleFactory& AggregateFunctionSimpleFactory::instance() {
     static std::once_flag oc;
@@ -102,6 +105,7 @@ AggregateFunctionSimpleFactory& AggregateFunctionSimpleFactory::instance() {
         register_aggregate_function_percentile_approx(instance);
         register_aggregate_function_window_funnel(instance);
         register_aggregate_function_window_funnel_old(instance);
+        register_aggregate_function_regr_union(instance);
         register_aggregate_function_retention(instance);
         register_aggregate_function_orthogonal_bitmap(instance);
         register_aggregate_function_collect_list(instance);
@@ -121,6 +125,9 @@ AggregateFunctionSimpleFactory& AggregateFunctionSimpleFactory::instance() {
         register_aggregate_function_covar_samp(instance);
 
         register_aggregate_function_combinator_foreach(instance);
+
+        register_aggregate_function_skewness(instance);
+        register_aggregate_function_kurtosis(instance);
     });
     return instance;
 }
