@@ -19,8 +19,10 @@ package org.apache.doris.binlog;
 
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.MTMV;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.TableIf.TableType;
+import org.apache.doris.common.AnalysisException;
 import org.apache.doris.persist.CreateTableInfo;
 import org.apache.doris.persist.gson.GsonUtils;
 
@@ -69,21 +71,30 @@ public class CreateTableRecord {
             this.dbId = db.getId();
         }
 
-        List<String> createTableStmt = Lists.newArrayList();
-        List<String> addPartitionStmt = Lists.newArrayList();
-        List<String> createRollupStmt = Lists.newArrayList();
-
-        table.readLock();
-        try {
-            Env.getSyncedDdlStmt(table, createTableStmt, addPartitionStmt, createRollupStmt,
-                    false, false /* show password */, -1L);
-        } finally {
-            table.readUnlock();
-        }
-        if (createTableStmt.size() > 0) {
-            this.sql = createTableStmt.get(0);
+        if (table instanceof MTMV) {
+            try {
+                this.sql =  Env.getMTMVDdl((MTMV) table);
+            } catch (AnalysisException e) {
+                LOG.warn("failed to get mtmv ddl,", e);
+                return;
+            }
         } else {
-            this.sql = "";
+            List<String> createTableStmt = Lists.newArrayList();
+            List<String> addPartitionStmt = Lists.newArrayList();
+            List<String> createRollupStmt = Lists.newArrayList();
+    
+            table.readLock();
+            try {
+                Env.getSyncedDdlStmt(table, createTableStmt, addPartitionStmt, createRollupStmt,
+                        false, false /* show password */, -1L);
+            } finally {
+                table.readUnlock();
+            }
+            if (createTableStmt.size() > 0) {
+                this.sql = createTableStmt.get(0);
+            } else {
+                this.sql = "";
+            }
         }
     }
 
