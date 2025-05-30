@@ -92,6 +92,12 @@ public class FeNameFormat {
         }
     }
 
+    public static void checkPartitionNameAllowEmpty(String partitionName) throws AnalysisException {
+        if (partitionName.startsWith(FORBIDDEN_PARTITION_NAME)) {
+            ErrorReport.reportAnalysisException(ErrorCode.ERR_WRONG_PARTITION_NAME, partitionName);
+        }
+    }
+
     public static void checkColumnName(String columnName) throws AnalysisException {
         if (Strings.isNullOrEmpty(columnName) || !columnName.matches(getColumnNameRegex())) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_WRONG_COLUMN_NAME,
