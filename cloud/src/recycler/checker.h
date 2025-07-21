@@ -107,6 +107,8 @@ public:
 
     int do_mow_job_key_check();
 
+    int do_partition_key_check();
+
     // If there are multiple buckets, return the minimum lifecycle; if there are no buckets (i.e.
     // all accessors are HdfsAccessor), return INT64_MAX.
     // Return 0 if success, otherwise error

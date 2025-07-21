@@ -177,6 +177,12 @@ int Checker::start() {
                 success = false;
             }
 
+            if (config::enable_partition_key_check) {
+                if (int ret = checker->do_partition_key_check(); ret != 0) {
+                    success = false;
+                }
+            }
+
             if (config::enable_inverted_check) {
                 if (int ret = checker->do_inverted_check(); ret != 0) {
                     success = false;
@@ -1521,6 +1527,58 @@ int InstanceChecker::do_mow_job_key_check() {
         }
         begin = it->next_begin_key(); // Update to next smallest key for iteration
     } while (it->more() && !stopped());
+    return 0;
+}
+
+int InstanceChecker::do_partition_key_check() {
+    LOG(INFO) << fmt::format("begin to do partition key check for instance_id={}", instance_id_);
+    std::unique_ptr<RangeGetIterator> it;
+    std::string begin = partition_version_key({instance_id_, 0, 0, 0});
+    std::string end = partition_version_key({instance_id_, INT64_MAX, 0, 0});
+    VersionPB partition_version;
+
+    auto check_partition = [&](const VersionPB& partition_version, const std::string& instance_id,
+                               long table_id, long partition_id) {
+        LOG(INFO) << fmt::format(
+                "[compaction key check] partition key check for instance_id={}, "
+                "table_id={}, partition_id={}, version={}",
+                instance_id, table_id, partition_id, partition_version.version());
+    };
+
+    do {
+        std::unique_ptr<Transaction> txn;
+        TxnErrorCode err = txn_kv_->create_txn(&txn);
+        if (err != TxnErrorCode::TXN_OK) {
+            LOG(WARNING) << "failed to create txn";
+            return -1;
+        }
+        err = txn->get(begin, end, &it);
+        if (err != TxnErrorCode::TXN_OK) {
+            LOG(WARNING) << "failed to get partition version key, err=" << err;
+            return -1;
+        }
+        while (it->has_next() && !stopped()) {
+            auto [k, v] = it->next();
+            std::string_view k1 = k;
+            k1.remove_prefix(1);
+            std::vector<std::tuple<std::variant<int64_t, std::string>, int, int>> out;
+            decode_key(&k1, &out);
+            // 0x01 "version" ${instance_id} "partition" ${db_id} ${table_id} ${partition_id}
+            auto table_id = std::get<int64_t>(std::get<0>(out[4]));
+            auto partition_id = std::get<int64_t>(std::get<0>(out[5]));
+            if (!partition_version.ParseFromArray(v.data(), v.size())) [[unlikely]] {
+                LOG(WARNING) << "failed to parse PartitionVersionPB";
+                return -1;
+            }
+            if (partition_version.version() <= 1) {
+                continue;
+            }
+            check_partition(partition_version, instance_id_, table_id, partition_id);
+        }
+        begin = it->next_begin_key(); // Update to next smallest key for iteration
+    } while (it->more() && !stopped());
+    LOG(INFO) << fmt::format("[compaction key check] partition key check passed for instance_id={}",
+                             instance_id_);
     return 0;
 }
 

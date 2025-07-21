@@ -105,6 +105,8 @@ CONF_mInt64(delete_bitmap_storage_optimize_v2_check_skip_seconds, "300"); // 5mi
 CONF_mInt32(scan_instances_interval_seconds, "60"); // 1min
 // interval for check object
 CONF_mInt32(check_object_interval_seconds, "43200"); // 12hours
+// enable partition key check
+CONF_Bool(enable_partition_key_check, "false");
 // enable recycler metrics statistics
 CONF_Bool(enable_recycler_stats_metrics, "false");
 
