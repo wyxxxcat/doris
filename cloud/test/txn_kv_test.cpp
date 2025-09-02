@@ -1582,3 +1582,32 @@ TEST(TxnKvTest, ReportConflictingRange) {
     ASSERT_EQ(values[1].second, "0");
     ASSERT_TRUE(values[1].first.starts_with(key));
 }
+
+TEST(TxnKvTest, GetInvalidKey) {
+    doris::TabletSchemaCloudPB schema;
+    schema.set_schema_version(1);
+    for (int i = 0; i < 10000; ++i) {
+        auto* column = schema.add_column();
+        column->set_unique_id(i);
+        column->set_name("col" + std::to_string(i));
+        column->set_type("VARCHAR");
+        column->set_aggregation("NONE");
+        column->set_length(100);
+        column->set_index_length(80);
+    }
+    std::cout << "value size=" << schema.SerializeAsString().size() << std::endl;
+
+    std::string instance_id = "put_large_value_" + std::to_string(::time(nullptr));
+    auto in = meta_schema_key({instance_id, 10005, 1});
+    std::string key;
+    std::unique_ptr<Transaction> txn;
+    ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+    doris::cloud::blob_put(txn.get(), key, schema, 1, 100);
+    ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+
+    ValueBuf value_buf;
+    ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+    std::string invalid_key = key.substr(0, key.size() - 10);
+    ASSERT_EQ(doris::cloud::blob_get(txn.get(), invalid_key, &value_buf),
+              TxnErrorCode::TXN_INVALID_DATA);
+}

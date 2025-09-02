@@ -127,8 +127,8 @@ static bool ensure_fields_are_splitable(const google::protobuf::Message& msg,
     return true;
 }
 
-static bool verify_message_split_fields(const google::protobuf::Message& msg,
-                                        const SplitSchemaPB& split_schema) {
+bool verify_message_split_fields(const google::protobuf::Message& msg,
+                                 const SplitSchemaPB& split_schema) {
     for (int64_t field_id : split_schema.split_field_ids()) {
         const google::protobuf::FieldDescriptor* field =
                 msg.GetDescriptor()->FindFieldByNumber(field_id);

@@ -138,4 +138,7 @@ TxnErrorCode document_get_versioned_children(FullRangeGetIterator* iter,
                                              google::protobuf::Message* msg);
 
 } // namespace versioned
+
+[[maybe_unused]] bool verify_message_split_fields(const google::protobuf::Message& msg,
+                                                  const SplitSchemaPB& split_schema);
 } // namespace doris::cloud

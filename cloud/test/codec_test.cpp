@@ -212,3 +212,122 @@ TEST(CodecTest, Int64CodecTest) {
         ASSERT_LT(out2, out1);
     }
 }
+
+TEST(CodecTest, DecodeInvalidBytes) {
+    using namespace doris::cloud;
+    int ret = 0;
+    std::string_view in;
+    std::string out;
+
+    // Invalid tag
+    {
+        std::string invalid;
+        invalid.push_back(0xff);
+        in = invalid;
+        ret = cloud::decode_bytes(&in, &out);
+        ASSERT_EQ(ret, -1);
+    }
+    // No ending
+    {
+        std::string invalid;
+        invalid.push_back(cloud::EncodingTag::BYTES_TAG);
+        in = invalid;
+        ret = cloud::decode_bytes(&in, &out);
+        ASSERT_EQ(ret, -2);
+    }
+    // Malformed ending
+    {
+        std::string invalid;
+        invalid.push_back(cloud::EncodingTag::BYTES_TAG);
+        invalid += "invalid bytes with malformed ending";
+        invalid.push_back(cloud::EncodingTag::BYTE_ESCAPE);
+        in = invalid;
+        ret = cloud::decode_bytes(&in, &out);
+        ASSERT_EQ(ret, -3);
+    }
+    // undefined escaping marker
+    {
+        std::string invalid;
+        invalid.push_back(cloud::EncodingTag::BYTES_TAG);
+        invalid.push_back(cloud::EncodingTag::BYTE_ESCAPE);
+        invalid.push_back('x');
+        in = invalid;
+        ret = cloud::decode_bytes(&in, &out);
+        ASSERT_EQ(ret, -4);
+    }
+}
+
+TEST(CodecTest, DecodeInvalidInt) {
+    using namespace doris::cloud;
+    int ret = 0;
+    std::string_view in;
+    int64_t out = 0;
+
+    // Invalid tag
+    {
+        std::string invalid;
+        invalid.push_back(0xff);
+        in = invalid;
+        ret = cloud::decode_int64(&in, &out);
+        ASSERT_EQ(ret, -1);
+    }
+    // Incomplete int
+    {
+        std::string invalid('a', 10);
+        in = invalid;
+        ret = cloud::decode_int64(&in, &out);
+        ASSERT_EQ(ret, -2);
+    }
+}
+
+TEST(CodecTest, DecodeInvalidVersionStamp) {
+    using namespace doris::cloud;
+    int ret = 0;
+    std::string_view in;
+    Versionstamp out;
+
+    // Invalid size for vs
+    {
+        std::string invalid;
+        invalid.push_back(0xff);
+        in = invalid;
+        ret = cloud::decode_versionstamp(&in, &out);
+        ASSERT_EQ(ret, -1);
+    }
+    // Invalid tag for vs
+    {
+        std::string invalid(11, 'a');
+        in = invalid;
+        ret = cloud::decode_versionstamp(&in, &out);
+        ASSERT_EQ(ret, -2);
+    }
+    // Invalid size for tailing vs
+    {
+        std::string invalid(5, 'a');
+        in = invalid;
+        ret = cloud::decode_tailing_versionstamp(&in, &out);
+        ASSERT_EQ(ret, -1);
+    }
+    // Invalid tag for tailing vs
+    {
+        std::string invalid(12, 'a');
+        in = invalid;
+        ret = cloud::decode_tailing_versionstamp(&in, &out);
+        ASSERT_EQ(ret, -2);
+    }
+    // Invalid tag for end vs
+    {
+        std::string invalid;
+        invalid.push_back(0x3f);
+        in = invalid;
+        ret = cloud::decode_versionstamp_end(&in);
+        ASSERT_EQ(ret, -1);
+    }
+    // Invalid tag for end vs
+    {
+        std::string invalid;
+        in = invalid;
+        ret = cloud::decode_versionstamp_end(&in);
+        ASSERT_EQ(ret, -1);
+    }
+}
