@@ -1597,3 +1597,129 @@ TEST(DocumentMessageTest, VersionedGetRangeWithRangeKeySelector) {
         case_index += 1;
     }
 }
+
+TEST(DocumentMessageTest, VerifyMessageSplitFieldsBranches) {
+    using doris::SplitSchemaPB;
+    // Test case 1: Field is not splitable (invalid field)
+    {
+        SplitSingleMessagePB msg;
+        msg.set_other_fields(1);
+
+        SplitSchemaPB split_schema;
+        split_schema.add_split_field_ids(999); // Invalid field ID
+
+        // This should return false because field 999 doesn't exist
+        ASSERT_FALSE(doris::cloud::verify_message_split_fields(msg, split_schema));
+    }
+
+    // Test case 2: Repeated field is empty but expected to be present
+    {
+        doris::RowsetMetaCloudPB meta;
+        meta.set_rowset_id(123);
+        meta.set_rowset_id_v2("test_rowset");
+        // Don't add any segments_key_bounds (keep it empty)
+
+        SplitSchemaPB split_schema;
+        split_schema.add_split_field_ids(doris::RowsetMetaCloudPB::kSegmentsKeyBoundsFieldNumber);
+
+        // This should return false because segments_key_bounds is empty
+        ASSERT_FALSE(verify_message_split_fields(meta, split_schema));
+    }
+
+    // Test case 3: Message field is not set but expected to be present
+    {
+        SplitSingleMessagePB msg;
+        msg.set_other_fields(1);
+        // Don't set segment_key_bounds
+
+        SplitSchemaPB split_schema;
+        split_schema.add_split_field_ids(SplitSingleMessagePB::kSegmentKeyBoundsFieldNumber);
+
+        // This should return false because segment_key_bounds is not set
+        ASSERT_FALSE(verify_message_split_fields(msg, split_schema));
+    }
+
+    // Test case 4: All validations pass - repeated field with content
+    {
+        doris::RowsetMetaCloudPB meta;
+        meta.set_rowset_id(123);
+        meta.set_rowset_id_v2("test_rowset");
+
+        // Add some segments_key_bounds
+        doris::KeyBoundsPB* key_bounds = meta.mutable_segments_key_bounds()->Add();
+        key_bounds->set_min_key("min_key");
+        key_bounds->set_max_key("max_key");
+
+        SplitSchemaPB split_schema;
+        split_schema.add_split_field_ids(doris::RowsetMetaCloudPB::kSegmentsKeyBoundsFieldNumber);
+
+        // This should return true because segments_key_bounds has content
+        ASSERT_TRUE(verify_message_split_fields(meta, split_schema));
+    }
+
+    // Test case 5: All validations pass - message field is set
+    {
+        SplitSingleMessagePB msg;
+        msg.set_other_fields(1);
+
+        // Set segment_key_bounds
+        auto* key_bounds = msg.mutable_segment_key_bounds();
+        key_bounds->set_min_key("min_key");
+        key_bounds->set_max_key("max_key");
+
+        SplitSchemaPB split_schema;
+        split_schema.add_split_field_ids(SplitSingleMessagePB::kSegmentKeyBoundsFieldNumber);
+
+        // This should return true because segment_key_bounds is set
+        ASSERT_TRUE(verify_message_split_fields(msg, split_schema));
+    }
+
+    // Test case 6: Multiple fields - some valid, some invalid
+    {
+        doris::TabletSchemaCloudPB schema;
+        schema.set_keys_type(doris::DUP_KEYS);
+
+        // Add some columns
+        doris::ColumnPB* column = schema.add_column();
+        column->set_name("test_col");
+        column->set_unique_id(1);
+
+        SplitSchemaPB split_schema;
+        split_schema.add_split_field_ids(doris::TabletSchemaCloudPB::kColumnFieldNumber); // Valid
+        split_schema.add_split_field_ids(999); // Invalid field ID
+
+        // This should return false because one of the fields is invalid
+        ASSERT_FALSE(verify_message_split_fields(schema, split_schema));
+    }
+
+    // Test case 7: Multiple valid fields
+    {
+        doris::TabletSchemaCloudPB schema;
+        schema.set_keys_type(doris::DUP_KEYS);
+
+        // Add some columns
+        doris::ColumnPB* column = schema.add_column();
+        column->set_name("test_col");
+        column->set_unique_id(1);
+
+        SplitSchemaPB split_schema;
+        split_schema.add_split_field_ids(doris::TabletSchemaCloudPB::kColumnFieldNumber);
+
+        // This should return true because all fields are valid and have content
+        ASSERT_TRUE(verify_message_split_fields(schema, split_schema));
+    }
+
+    // Test case 8: Field exists but is not a message or repeated field
+    {
+        doris::RowsetMetaCloudPB meta;
+        meta.set_rowset_id(123);
+
+        SplitSchemaPB split_schema;
+        split_schema.add_split_field_ids(
+                doris::RowsetMetaCloudPB::
+                        kRowsetIdFieldNumber); // This is an int64 field, not splitable
+
+        // This should return false because rowset_id is not a splitable field
+        ASSERT_FALSE(verify_message_split_fields(meta, split_schema));
+    }
+}
