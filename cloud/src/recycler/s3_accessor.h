@@ -24,8 +24,8 @@
 #include <cstdint>
 #include <memory>
 
+#include "client/obj_storage_client.h"
 #include "cpp/aws_common.h"
-#include "recycler/obj_storage_client.h"
 #include "recycler/storage_vault_accessor.h"
 
 namespace Aws::S3 {

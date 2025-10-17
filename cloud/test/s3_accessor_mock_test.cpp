@@ -69,7 +69,7 @@ TEST_F(S3AccessorMockTest, list_objects_compatibility) {
     // If storage only supports ListObjectsV1, s3_obj_storage_client.list_objects
     // should return an error.
     auto mock_s3_client = std::make_shared<MockS3Client>();
-    S3ObjClient s3_obj_client(mock_s3_client, "dummy-endpoint");
+    S3ObjStorageClient s3_obj_client(mock_s3_client, "dummy-endpoint");
 
     ListObjectsV2Result result;
     result.SetIsTruncated(true);

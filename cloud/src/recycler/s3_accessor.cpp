@@ -25,9 +25,12 @@
 #include <aws/s3/S3Client.h>
 #include <aws/sts/STSClient.h>
 #include <bvar/reducer.h>
+#include <gen_cpp/Status_types.h>
 #include <gen_cpp/cloud.pb.h>
 
 #include <algorithm>
+
+#include "meta-store/txn_kv_error.h"
 
 #ifdef USE_AZURE
 #include <azure/core/diagnostics/logger.hpp>
@@ -51,10 +54,10 @@
 #include "cpp/sync_point.h"
 #include "cpp/util.h"
 #ifdef USE_AZURE
-#include "recycler/azure_obj_client.h"
+#include "client/azure_obj_storage_client.h"
 #endif
-#include "recycler/obj_storage_client.h"
-#include "recycler/s3_obj_client.h"
+#include "client/obj_storage_client.h"
+#include "client/s3_obj_storage_client.h"
 #include "recycler/storage_vault_accessor.h"
 
 namespace doris::cloud {
@@ -170,15 +173,15 @@ public:
 
     bool is_valid() override { return iter_->is_valid(); }
 
-    bool has_next() override { return iter_->has_next(); }
+    ObjectStorageResponse has_next() override { return iter_->has_next(); }
 
     std::optional<FileMeta> next() override {
         std::optional<FileMeta> ret;
-        if (auto obj = iter_->next(); obj.has_value()) {
+        if (auto obj = iter_->next(); obj.resp.status.code == TStatusCode::OK) {
             ret = FileMeta {
-                    .path = get_relative_path(obj->key),
-                    .size = obj->size,
-                    .mtime_s = obj->mtime_s,
+                    .path = get_relative_path(obj.results_->file_path),
+                    .size = obj.results_->size,
+                    .mtime_s = obj.results_->mtime_s,
             };
         }
         return ret;
@@ -390,7 +393,7 @@ int S3Accessor::init() {
                 uri_, cred, std::move(options));
         // uri format for debug: ${scheme}://${ak}.blob.core.windows.net/${bucket}/${prefix}
         uri_ = normalize_http_uri(uri_ + '/' + conf_.prefix);
-        obj_client_ = std::make_shared<AzureObjClient>(std::move(container_client));
+        obj_client_ = std::make_shared<AzureObjStorageClient>(std::move(container_client));
         return 0;
 #else
         LOG_FATAL("BE is not compiled with azure support, export BUILD_AZURE=ON before building");
@@ -431,7 +434,7 @@ int S3Accessor::init() {
                 get_aws_credentials_provider(conf_), std::move(aws_config),
                 Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
                 conf_.use_virtual_addressing /* useVirtualAddressing */);
-        obj_client_ = std::make_shared<S3ObjClient>(std::move(s3_client), conf_.endpoint);
+        obj_client_ = std::make_shared<S3ObjStorageClient>(std::move(s3_client));
         return 0;
     }
     }
@@ -439,10 +442,12 @@ int S3Accessor::init() {
 
 int S3Accessor::delete_prefix_impl(const std::string& path_prefix, int64_t expiration_time) {
     LOG_INFO("delete prefix").tag("uri", to_uri(path_prefix));
-    return obj_client_
-            ->delete_objects_recursively({.bucket = conf_.bucket, .key = get_key(path_prefix)},
-                                         {.executor = worker_pool}, expiration_time)
-            .ret;
+    // return obj_client_
+    //         ->delete_objects_recursively({.bucket = conf_.bucket, .key = get_key(path_prefix)},
+    //                                      {.executor = worker_pool}, expiration_time)
+    //         .status.code;
+    // TODO: accessor work pool batch delete
+    return 0;
 }
 
 int S3Accessor::delete_prefix(const std::string& path_prefix, int64_t expiration_time) {
@@ -483,27 +488,32 @@ int S3Accessor::delete_files(const std::vector<std::string>& paths) {
         keys.emplace_back(get_key(path));
     }
 
-    return obj_client_->delete_objects(conf_.bucket, std::move(keys), {.executor = worker_pool})
-            .ret;
+    // return obj_client_->delete_objects(conf_.bucket, std::move(keys), {.executor = worker_pool})
+    //         .status.code;
+    // TODO: accessor work pool batch delete
+    return 0;
 }
 
 int S3Accessor::delete_file(const std::string& path) {
     LOG_INFO("delete file").tag("uri", to_uri(path));
-    int ret = obj_client_->delete_object({.bucket = conf_.bucket, .key = get_key(path)}).ret;
-    static_assert(ObjectStorageResponse::OK == 0);
-    if (ret == ObjectStorageResponse::OK || ret == ObjectStorageResponse::NOT_FOUND) {
+    int ret =
+            obj_client_->delete_object({.bucket = conf_.bucket, .key = get_key(path)}).status.code;
+    static_assert(ObjectStorageStatus::OK == 0);
+    if (ret == ObjectStorageStatus::OK || ret == ObjectStorageStatus::NOT_FOUND) {
         return 0;
     }
     return ret;
 }
 
 int S3Accessor::put_file(const std::string& path, const std::string& content) {
-    return obj_client_->put_object({.bucket = conf_.bucket, .key = get_key(path)}, content).ret;
+    return obj_client_->put_object({.bucket = conf_.bucket, .key = get_key(path)}, content)
+            .status.code;
 }
 
 int S3Accessor::list_prefix(const std::string& path_prefix, std::unique_ptr<ListIterator>* res) {
     *res = std::make_unique<S3ListIterator>(
-            obj_client_->list_objects({conf_.bucket, get_key(path_prefix)}),
+            obj_client_->list_objects({conf_.bucket, get_key(path_prefix)},
+                                      {.endpoint = conf_.endpoint}),
             conf_.prefix.length() + 1 /* {prefix}/ */);
     return 0;
 }
@@ -525,17 +535,17 @@ int S3Accessor::list_all(std::unique_ptr<ListIterator>* res) {
 
 int S3Accessor::exists(const std::string& path) {
     ObjectMeta obj_meta;
-    return obj_client_->head_object({.bucket = conf_.bucket, .key = get_key(path)}, &obj_meta).ret;
+    return obj_client_->head_object({.bucket = conf_.bucket, .key = get_key(path)}).file_size;
 }
 
 int S3Accessor::abort_multipart_upload(const std::string& path, const std::string& upload_id) {
     LOG_INFO("abort multipart upload").tag("uri", to_uri(path)).tag("upload_id", upload_id);
     int ret = obj_client_
                       ->abort_multipart_upload({.bucket = conf_.bucket, .key = get_key(path)},
-                                               upload_id)
-                      .ret;
-    static_assert(ObjectStorageResponse::OK == 0);
-    if (ret == ObjectStorageResponse::OK || ret == ObjectStorageResponse::NOT_FOUND) {
+                                               {.endpoint = conf_.endpoint}, upload_id)
+                      .status.code;
+    static_assert(ObjectStorageStatus::OK == 0);
+    if (ret == ObjectStorageStatus::OK || ret == ObjectStorageStatus::NOT_FOUND) {
         return 0;
     }
     LOG_WARNING("fail abort multipart upload")
@@ -546,23 +556,32 @@ int S3Accessor::abort_multipart_upload(const std::string& path, const std::strin
 }
 
 int S3Accessor::get_life_cycle(int64_t* expiration_days) {
-    return obj_client_->get_life_cycle(conf_.bucket, expiration_days).ret;
+    return obj_client_->get_life_cycle(conf_.endpoint, conf_.bucket, expiration_days).status.code;
 }
 
 int S3Accessor::check_versioning() {
-    return obj_client_->check_versioning(conf_.bucket).ret;
+    return obj_client_->check_versioning(conf_.endpoint, conf_.bucket).status.code;
 }
 
 int GcsAccessor::delete_prefix_impl(const std::string& path_prefix, int64_t expiration_time) {
     LOG_INFO("begin delete prefix").tag("uri", to_uri(path_prefix));
 
     int ret = 0;
+    // TODO: wyx chore
     int cnt = 0;
     int skip = 0;
     int64_t del_nonexisted = 0;
     int del = 0;
-    auto iter = obj_client_->list_objects({conf_.bucket, get_key(path_prefix)});
-    for (auto obj = iter->next(); obj.has_value(); obj = iter->next()) {
+    auto iter =
+            obj_client_->list_objects({.full_path = conf_.bucket, .bucket = get_key(path_prefix)},
+                                      {.endpoint = conf_.endpoint});
+    do {
+        auto list_result = iter->next();
+        if (list_result.resp.status.code != TStatusCode::OK) {
+            ret = list_result.resp.status.code;
+            break;
+        }
+        auto obj = list_result.results_.value();
         if (!(++cnt % 100)) {
             LOG_INFO("loop delete prefix")
                     .tag("uri", to_uri(path_prefix))
@@ -571,20 +590,22 @@ int GcsAccessor::delete_prefix_impl(const std::string& path_prefix, int64_t expi
                     .tag("del_nonexisted", del_nonexisted)
                     .tag("skipped", skip);
         }
-        if (expiration_time > 0 && obj->mtime_s > expiration_time) {
+        if (expiration_time > 0 && obj.mtime_s > expiration_time) {
             skip++;
             continue;
         }
         del++;
 
         // FIXME(plat1ko): Delete objects by batch with genuine GCS client
-        int del_ret = obj_client_->delete_object({conf_.bucket, obj->key}).ret;
-        del_nonexisted += (del_ret == ObjectStorageResponse::NOT_FOUND);
-        static_assert(ObjectStorageResponse::OK == 0);
-        if (del_ret != ObjectStorageResponse::OK && del_ret != ObjectStorageResponse::NOT_FOUND) {
+        int del_ret =
+                obj_client_->delete_object({.full_path = conf_.bucket, .bucket = obj.file_path})
+                        .status.code;
+        del_nonexisted += (del_ret == ObjectStorageStatus::NOT_FOUND);
+        static_assert(ObjectStorageStatus::OK == 0);
+        if (del_ret != ObjectStorageStatus::OK && del_ret != ObjectStorageStatus::NOT_FOUND) {
             ret = del_ret;
         }
-    }
+    } while (iter->is_valid());
 
     LOG_INFO("finish delete prefix")
             .tag("uri", to_uri(path_prefix))

@@ -226,7 +226,7 @@ TEST_F(S3AccessorTest, s3) {
             },
             &guards.emplace_back());
     sp->set_call_back(
-            "S3ObjClient::delete_objects",
+            "S3ObjStorageClient::delete_objects",
             [](auto&& args) {
                 auto* delete_batch_size = try_any_cast<size_t*>(args[0]);
                 *delete_batch_size = 7;
@@ -268,7 +268,7 @@ TEST_F(S3AccessorTest, azure) {
             },
             &guards.emplace_back());
     sp->set_call_back(
-            "AzureObjClient::delete_objects",
+            "ObjStorageClient::delete_objects",
             [](auto&& args) {
                 auto* delete_batch_size = try_any_cast<size_t*>(args[0]);
                 *delete_batch_size = 7;
@@ -310,7 +310,7 @@ TEST_F(S3AccessorTest, gcs) {
             },
             &guards.emplace_back());
     sp->set_call_back(
-            "S3ObjClient::delete_objects",
+            "S3ObjStorageClient::delete_objects",
             [](auto&& args) {
                 auto* delete_batch_size = try_any_cast<size_t*>(args[0]);
                 *delete_batch_size = 7;
@@ -368,7 +368,7 @@ TEST_F(S3AccessorTest, path_style_test) {
     };
 
     int case_idx = 0;
-    sp->set_call_back("S3ObjClient::delete_object",
+    sp->set_call_back("S3ObjStorageClient::delete_object",
             [&case_idx, &inputs](auto&& args) {
                 auto* res = try_any_cast<Aws::S3::Model::DeleteObjectOutcome*>(args[0]);
                 EXPECT_EQ(std::get<2>(inputs[case_idx]), static_cast<int>(res->GetError().GetResponseCode())) << "<<<<<<<<<<<<<<<<<<<<< " << case_idx;
@@ -456,7 +456,7 @@ TEST_F(S3AccessorRoleTest, s3) {
             },
             &guards.emplace_back());
     sp->set_call_back(
-            "S3ObjClient::delete_objects",
+            "S3ObjStorageClient::delete_objects",
             [](auto&& args) {
                 auto* delete_batch_size = try_any_cast<size_t*>(args[0]);
                 *delete_batch_size = 7;

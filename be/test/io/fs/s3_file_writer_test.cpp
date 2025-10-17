@@ -1087,7 +1087,7 @@ namespace io {
 /**
  * This class is for boundary test
  */
-class SimpleMockObjStorageClient : public io::ObjStorageClient {
+class SimpleMockObjStorageClient : public ObjStorageClient {
 public:
     SimpleMockObjStorageClient() = default;
     ~SimpleMockObjStorageClient() override = default;

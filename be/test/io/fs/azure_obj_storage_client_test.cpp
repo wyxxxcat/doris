@@ -19,8 +19,8 @@
 
 #include <gtest/gtest.h>
 
+#include "client/obj_storage_client.h"
 #include "io/fs/file_system.h"
-#include "io/fs/obj_storage_client.h"
 #include "util/s3_util.h"
 
 #ifdef USE_AZURE
@@ -38,7 +38,7 @@ using namespace Azure::Storage::Blobs;
 
 class AzureObjStorageClientTest : public testing::Test {
 protected:
-    static std::shared_ptr<io::ObjStorageClient> obj_storage_client;
+    static std::shared_ptr<ObjStorageClient> obj_storage_client;
 
     static void SetUpTestSuite() {
         if (!std::getenv("AZURE_ACCOUNT_NAME") || !std::getenv("AZURE_ACCOUNT_KEY") ||
@@ -60,7 +60,7 @@ protected:
                  .sk = accountKey,
                  .token = "",
                  .bucket = containerName,
-                 .provider = io::ObjStorageType::AZURE,
+                 .provider = ObjStorageType::AZURE,
                  .role_arn = "",
                  .external_id = ""});
     }
@@ -72,7 +72,7 @@ protected:
     }
 };
 
-std::shared_ptr<io::ObjStorageClient> AzureObjStorageClientTest::obj_storage_client = nullptr;
+std::shared_ptr<ObjStorageClient> AzureObjStorageClientTest::obj_storage_client = nullptr;
 
 TEST_F(AzureObjStorageClientTest, put_list_delete_object) {
     LOG(INFO) << "AzureObjStorageClientTest::put_list_delete_object";

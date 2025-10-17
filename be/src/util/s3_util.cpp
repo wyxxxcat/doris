@@ -51,10 +51,10 @@
 #include "cpp/sync_point.h"
 #include "cpp/util.h"
 #ifdef USE_AZURE
-#include "io/fs/azure_obj_storage_client.h"
+#include "client/azure_obj_storage_client.h"
 #endif
-#include "io/fs/obj_storage_client.h"
-#include "io/fs/s3_obj_storage_client.h"
+#include "client/obj_storage_client.h"
+#include "client/s3_obj_storage_client.h"
 #include "runtime/exec_env.h"
 #include "s3_uri.h"
 #include "vec/exec/scan/scanner_scheduler.h"
@@ -196,7 +196,7 @@ S3ClientFactory& S3ClientFactory::instance() {
     return ret;
 }
 
-std::shared_ptr<io::ObjStorageClient> S3ClientFactory::create(const S3ClientConf& s3_conf) {
+std::shared_ptr<ObjStorageClient> S3ClientFactory::create(const S3ClientConf& s3_conf) {
     if (!is_s3_conf_valid(s3_conf).ok()) {
         return nullptr;
     }
@@ -210,9 +210,8 @@ std::shared_ptr<io::ObjStorageClient> S3ClientFactory::create(const S3ClientConf
         }
     }
 
-    auto obj_client = (s3_conf.provider == io::ObjStorageType::AZURE)
-                              ? _create_azure_client(s3_conf)
-                              : _create_s3_client(s3_conf);
+    auto obj_client = (s3_conf.provider == ObjStorageType::AZURE) ? _create_azure_client(s3_conf)
+                                                                  : _create_s3_client(s3_conf);
 
     {
         uint64_t hash = s3_conf.get_hash();
@@ -222,7 +221,7 @@ std::shared_ptr<io::ObjStorageClient> S3ClientFactory::create(const S3ClientConf
     return obj_client;
 }
 
-std::shared_ptr<io::ObjStorageClient> S3ClientFactory::_create_azure_client(
+std::shared_ptr<ObjStorageClient> S3ClientFactory::_create_azure_client(
         const S3ClientConf& s3_conf) {
 #ifdef USE_AZURE
     auto cred =
@@ -250,7 +249,7 @@ std::shared_ptr<io::ObjStorageClient> S3ClientFactory::_create_azure_client(
     auto containerClient = std::make_shared<Azure::Storage::Blobs::BlobContainerClient>(
             uri, cred, std::move(options));
     LOG_INFO("create one azure client with {}", s3_conf.to_string());
-    return std::make_shared<io::AzureObjStorageClient>(std::move(containerClient));
+    return std::make_shared<AzureObjStorageClient>(std::move(containerClient));
 #else
     LOG_FATAL("BE is not compiled with azure support, export BUILD_AZURE=ON before building");
     return nullptr;
@@ -347,8 +346,7 @@ std::shared_ptr<Aws::Auth::AWSCredentialsProvider> S3ClientFactory::get_aws_cred
     return _get_aws_credentials_provider_v1(s3_conf);
 }
 
-std::shared_ptr<io::ObjStorageClient> S3ClientFactory::_create_s3_client(
-        const S3ClientConf& s3_conf) {
+std::shared_ptr<ObjStorageClient> S3ClientFactory::_create_s3_client(const S3ClientConf& s3_conf) {
     TEST_SYNC_POINT_RETURN_WITH_VALUE(
             "s3_client_factory::create",
             std::make_shared<io::S3ObjStorageClient>(std::make_shared<Aws::S3::S3Client>()));
@@ -394,7 +392,7 @@ std::shared_ptr<io::ObjStorageClient> S3ClientFactory::_create_s3_client(
             Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
             s3_conf.use_virtual_addressing);
 
-    auto obj_client = std::make_shared<io::S3ObjStorageClient>(std::move(new_client));
+    auto obj_client = std::make_shared<S3ObjStorageClient>(std::move(new_client));
     LOG_INFO("create one s3 client with {}", s3_conf.to_string());
     return obj_client;
 }
@@ -440,7 +438,7 @@ Status S3ClientFactory::convert_properties_to_s3_conf(
     if (auto it = properties.find(S3_PROVIDER); it != properties.end()) {
         // S3 Provider properties should be case insensitive.
         if (0 == strcasecmp(it->second.c_str(), AZURE_PROVIDER_STRING)) {
-            s3_conf->client_conf.provider = io::ObjStorageType::AZURE;
+            s3_conf->client_conf.provider = ObjStorageType::AZURE;
         }
     }
 
@@ -501,7 +499,7 @@ S3Conf S3Conf::get_s3_conf(const cloud::ObjectStoreInfoPB& info) {
                     .sk = info.sk(),
                     .token {},
                     .bucket = info.bucket(),
-                    .provider = io::ObjStorageType::AWS,
+                    .provider = ObjStorageType::AWS,
                     .use_virtual_addressing =
                             info.has_use_path_style() ? !info.use_path_style() : true,
 
@@ -515,31 +513,31 @@ S3Conf S3Conf::get_s3_conf(const cloud::ObjectStoreInfoPB& info) {
         ret.client_conf.cred_provider_type = cred_provider_type_from_pb(info.cred_provider_type());
     }
 
-    io::ObjStorageType type = io::ObjStorageType::AWS;
+    ObjStorageType type = ObjStorageType::AWS;
     switch (info.provider()) {
     case cloud::ObjectStoreInfoPB_Provider_OSS:
-        type = io::ObjStorageType::OSS;
+        type = ObjStorageType::OSS;
         break;
     case cloud::ObjectStoreInfoPB_Provider_S3:
-        type = io::ObjStorageType::AWS;
+        type = ObjStorageType::AWS;
         break;
     case cloud::ObjectStoreInfoPB_Provider_COS:
-        type = io::ObjStorageType::COS;
+        type = ObjStorageType::COS;
         break;
     case cloud::ObjectStoreInfoPB_Provider_OBS:
-        type = io::ObjStorageType::OBS;
+        type = ObjStorageType::OBS;
         break;
     case cloud::ObjectStoreInfoPB_Provider_BOS:
-        type = io::ObjStorageType::BOS;
+        type = ObjStorageType::BOS;
         break;
     case cloud::ObjectStoreInfoPB_Provider_GCP:
-        type = io::ObjStorageType::GCP;
+        type = ObjStorageType::GCP;
         break;
     case cloud::ObjectStoreInfoPB_Provider_AZURE:
-        type = io::ObjStorageType::AZURE;
+        type = ObjStorageType::AZURE;
         break;
     case cloud::ObjectStoreInfoPB_Provider_TOS:
-        type = io::ObjStorageType::TOS;
+        type = ObjStorageType::TOS;
         break;
     default:
         __builtin_unreachable();
@@ -560,7 +558,7 @@ S3Conf S3Conf::get_s3_conf(const TS3StorageParam& param) {
                     .sk = param.sk,
                     .token = param.token,
                     .bucket = param.bucket,
-                    .provider = io::ObjStorageType::AWS,
+                    .provider = ObjStorageType::AWS,
                     .max_connections = param.max_conn,
                     .request_timeout_ms = param.request_timeout_ms,
                     .connect_timeout_ms = param.conn_timeout_ms,
@@ -576,36 +574,36 @@ S3Conf S3Conf::get_s3_conf(const TS3StorageParam& param) {
                 cred_provider_type_from_thrift(param.cred_provider_type);
     }
 
-    io::ObjStorageType type = io::ObjStorageType::AWS;
+    ObjStorageType type = ObjStorageType::AWS;
     switch (param.provider) {
     case TObjStorageType::UNKNOWN:
         LOG_INFO("Receive one legal storage resource, set provider type to aws, param detail {}",
                  ret.to_string());
-        type = io::ObjStorageType::AWS;
+        type = ObjStorageType::AWS;
         break;
     case TObjStorageType::AWS:
-        type = io::ObjStorageType::AWS;
+        type = ObjStorageType::AWS;
         break;
     case TObjStorageType::AZURE:
-        type = io::ObjStorageType::AZURE;
+        type = ObjStorageType::AZURE;
         break;
     case TObjStorageType::BOS:
-        type = io::ObjStorageType::BOS;
+        type = ObjStorageType::BOS;
         break;
     case TObjStorageType::COS:
-        type = io::ObjStorageType::COS;
+        type = ObjStorageType::COS;
         break;
     case TObjStorageType::OBS:
-        type = io::ObjStorageType::OBS;
+        type = ObjStorageType::OBS;
         break;
     case TObjStorageType::OSS:
-        type = io::ObjStorageType::OSS;
+        type = ObjStorageType::OSS;
         break;
     case TObjStorageType::GCP:
-        type = io::ObjStorageType::GCP;
+        type = ObjStorageType::GCP;
         break;
     case TObjStorageType::TOS:
-        type = io::ObjStorageType::TOS;
+        type = ObjStorageType::TOS;
         break;
     default:
         LOG_FATAL("unknown provider type {}, info {}", param.provider, ret.to_string());

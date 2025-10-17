@@ -17,14 +17,14 @@
 
 #include <gtest/gtest.h>
 
-#include "io/fs/obj_storage_client.h"
+#include "client/obj_storage_client.h"
 #include "util/s3_util.h"
 
 namespace doris {
 
 class S3ObjStorageClientTest : public testing::Test {
 protected:
-    static std::shared_ptr<io::ObjStorageClient> obj_storage_client;
+    static std::shared_ptr<ObjStorageClient> obj_storage_client;
     static std::string bucket;
 
     static void SetUpTestSuite() {
@@ -46,7 +46,7 @@ protected:
                 .sk = secret_key,
                 .token = "",
                 .bucket = bucket,
-                .provider = io::ObjStorageType::AWS,
+                .provider = ObjStorageType::AWS,
                 .use_virtual_addressing = false,
                 .role_arn = "",
                 .external_id = "",
@@ -62,7 +62,7 @@ protected:
     }
 };
 
-std::shared_ptr<io::ObjStorageClient> S3ObjStorageClientTest::obj_storage_client = nullptr;
+std::shared_ptr<ObjStorageClient> S3ObjStorageClientTest::obj_storage_client = nullptr;
 std::string S3ObjStorageClientTest::bucket;
 
 TEST_F(S3ObjStorageClientTest, put_list_delete_object) {

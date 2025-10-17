@@ -17,70 +17,142 @@
 
 #pragma once
 
-#include <optional>
+#include <gen_cpp/Status_types.h>
 
-#include "io/fs/file_system.h"
-#include "io/fs/path.h"
+#include <filesystem>
+#include <optional>
+#include <string_view>
+#include <vector>
+
 namespace doris {
 class Status;
 struct S3ClientConf;
-namespace io {
+
+using Path = std::filesystem::path;
+
+inline Path operator/(Path&& lhs, const Path& rhs) {
+    return std::move(lhs /= rhs);
+}
 
 // Names are in lexico order.
 enum class ObjStorageType : uint8_t {
     UNKNOWN = 0,
     AWS = 1,
-    AZURE,
-    BOS,
-    COS,
-    OSS,
-    OBS,
-    GCP,
-    TOS,
+    AZURE = 2,
+    BOS = 3,
+    COS = 4,
+    OSS = 5,
+    OBS = 6,
+    GCP = 7,
+    TOS = 8,
 };
 
+/// eg:
+///     s3://bucket1/path/to/file.txt
+/// _full_path: s3://bucket1/path/to/file.txt
+/// _bucket: bucket1
+/// _key:    path/to/file.txt
 struct ObjectStoragePathOptions {
-    Path path = "";
-    std::string bucket = std::string();                  // blob container in azure
-    std::string key = std::string();                     // blob name in azure
-    std::string prefix = std::string();                  // for batch delete and recursive delete
+    Path full_path = "";
+    std::string bucket;                                  // blob container in azure
+    std::string key;                                     // blob name in azure
     std::optional<std::string> upload_id = std::nullopt; // only used for S3 upload
+};
+
+struct ObjectClientConfigOptions {
+    std::string endpoint;
+    std::optional<std::string> ak = std::nullopt;
+    std::optional<std::string> sk = std::nullopt;
+};
+
+struct ObjectMeta {
+    std::string file_path;
+    int64_t size {0};
+    int64_t mtime_s {0};
 };
 
 struct ObjectCompleteMultiPart {
     int part_num = 0;
-    std::string etag = std::string();
+    std::string etag;
 };
 
 struct ObjectStorageStatus {
-    int code = 0;
-    std::string msg = std::string();
+    enum Code : int {
+        UNDEFINED = -1,
+        OK = 0,
+        NOT_FOUND = 1,
+        RATE_LIMIT = 2,
+    };
+
+    ObjectStorageStatus(int r = OK, std::string msg = "") : code(r), msg(std::move(msg)) {}
+    // clang-format off
+    int code {OK}; // To unify the error handle logic with BE, we'd better use the same error code as BE
+    // clang-format on
+    std::string msg;
 };
 
 // We only store error code along with err_msg instead of Status to unify BE and recycler's error handle logic
 struct ObjectStorageResponse {
-    ObjectStorageStatus status {};
+    ObjectStorageStatus status {0, ""};
     int http_code {200};
-    std::string request_id = std::string();
+    std::string request_id {};
     static ObjectStorageResponse OK() {
         // clang-format off
         return {
-                .status { .code = 0, },
+                .status = ObjectStorageStatus{0, ""},
                 .http_code = 200,
+                .request_id = ""
         };
         // clang-format on
     }
 };
 
+struct ObjectStorageRateLimitResponse : public ObjectStorageResponse {
+    ObjectStorageRateLimitResponse() {
+        status.code = ObjectStorageStatus::RATE_LIMIT;
+        status.msg = "Rate limit exceeded";
+        http_code = 429;
+    }
+};
+
 struct ObjectStorageUploadResponse {
-    ObjectStorageResponse resp {};
+    ObjectStorageResponse resp;
     std::optional<std::string> upload_id = std::nullopt;
     std::optional<std::string> etag = std::nullopt;
 };
 
 struct ObjectStorageHeadResponse {
-    ObjectStorageResponse resp {};
+    ObjectStorageResponse resp;
     long long file_size {0};
+};
+
+struct ObjectStorageListResponse {
+    ObjectStorageResponse resp;
+    std::optional<ObjectMeta> results_ = std::nullopt;
+};
+
+class ObjectListIterator {
+public:
+    virtual ~ObjectListIterator() = default;
+    virtual bool is_valid() { return is_valid_; }
+    virtual ObjectStorageResponse has_next() = 0;
+    virtual ObjectStorageListResponse next() {
+        std::optional<ObjectMeta> res;
+        auto resp = has_next();
+        if (resp.status.code != TStatusCode::OK) {
+            return ObjectStorageListResponse {.resp = std::move(resp), .results_ = {}};
+        }
+
+        res = std::move(results_.back());
+        results_.pop_back();
+        return ObjectStorageListResponse {.resp = ObjectStorageResponse::OK(),
+                                          .results_ = {std::move(*res)}};
+    }
+
+protected:
+    std::vector<ObjectMeta> results_;
+    bool is_valid_ {true};
+    bool has_more_ {true};
 };
 
 class ObjStorageClient {
@@ -89,7 +161,7 @@ public:
     // Create a multi-part upload request. On AWS-compatible systems, it will return an upload ID, but not on Azure.
     // The input parameters should include the bucket and key for the object storage.
     virtual ObjectStorageUploadResponse create_multipart_upload(
-            const ObjectStoragePathOptions& opts) = 0;
+            const ObjectStoragePathOptions& opts, const ObjectClientConfigOptions& config) = 0;
     // To directly upload a piece of data to object storage and generate a user-visible file.
     // You need to clearly specify the bucket and key
     virtual ObjectStorageResponse put_object(const ObjectStoragePathOptions& opts,
@@ -116,20 +188,34 @@ public:
                                              size_t* size_return) = 0;
     // According to the passed bucket and prefix, it traverses and retrieves all files under the prefix, and returns the name and file size of all files.
     // **Notice**: The files returned by this function contains the full key in object storage.
-    virtual ObjectStorageResponse list_objects(const ObjectStoragePathOptions& opts,
-                                               std::vector<FileInfo>* files) = 0;
+    virtual std::unique_ptr<ObjectListIterator> list_objects(
+            const ObjectStoragePathOptions& path, const ObjectClientConfigOptions& config) = 0;
+
     // According to the bucket and prefix specified by the user, it performs batch deletion based on the object names in the object array.
     virtual ObjectStorageResponse delete_objects(const ObjectStoragePathOptions& opts,
                                                  std::vector<std::string> objs) = 0;
     // Delete the file named key in the object storage bucket.
     virtual ObjectStorageResponse delete_object(const ObjectStoragePathOptions& opts) = 0;
     // According to the prefix, recursively delete all files under the prefix.
-    virtual ObjectStorageResponse delete_objects_recursively(
-            const ObjectStoragePathOptions& opts) = 0;
+    virtual ObjectStorageResponse delete_objects_recursively(const ObjectStoragePathOptions& opts,
+                                                             const std::string& prefix) = 0;
     // Return a presigned URL for users to access the object
     virtual std::string generate_presigned_url(const ObjectStoragePathOptions& opts,
-                                               int64_t expiration_secs,
-                                               const S3ClientConf& conf) = 0;
+                                               const ObjectClientConfigOptions& config,
+                                               int64_t expiration_secs) = 0;
+
+    // Get the objects' expiration time on the bucket
+    virtual ObjectStorageResponse get_life_cycle(const std::string& endpoint,
+                                                 const std::string& bucket,
+                                                 int64_t* expiration_days) = 0;
+
+    // Check if the objects' versioning is on or off
+    // returns 0 when versioning is on, otherwise versioning is off or check failed
+    virtual ObjectStorageResponse check_versioning(const std::string& endpoint_,
+                                                   const std::string& bucket) = 0;
+
+    virtual ObjectStorageResponse abort_multipart_upload(const ObjectStoragePathOptions& path,
+                                                         const ObjectClientConfigOptions& config,
+                                                         const std::string& upload_id) = 0;
 };
-} // namespace io
 } // namespace doris

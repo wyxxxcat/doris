@@ -17,14 +17,14 @@
 
 #include <gtest/gtest.h>
 
-#include "io/fs/obj_storage_client.h"
+#include "client/obj_storage_client.h"
 #include "util/s3_util.h"
 
 namespace doris {
 
 class S3ObjStorageClientRoleTest : public testing::Test {
 protected:
-    static std::shared_ptr<io::ObjStorageClient> obj_storage_client;
+    static std::shared_ptr<ObjStorageClient> obj_storage_client;
     static std::string bucket;
     static std::string prefix;
 
@@ -55,7 +55,7 @@ protected:
                  .sk = "",
                  .token = "",
                  .bucket = bucket,
-                 .provider = io::ObjStorageType::AWS,
+                 .provider = ObjStorageType::AWS,
                  .use_virtual_addressing = false,
                  .cred_provider_type = CredProviderType::InstanceProfile,
                  .role_arn = role_arn,
@@ -71,7 +71,7 @@ protected:
     }
 };
 
-std::shared_ptr<io::ObjStorageClient> S3ObjStorageClientRoleTest::obj_storage_client = nullptr;
+std::shared_ptr<ObjStorageClient> S3ObjStorageClientRoleTest::obj_storage_client = nullptr;
 std::string S3ObjStorageClientRoleTest::bucket;
 std::string S3ObjStorageClientRoleTest::prefix;
 
