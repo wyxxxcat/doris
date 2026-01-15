@@ -189,6 +189,18 @@ CONF_String(specific_max_qps_limit, "get_cluster:5000000;begin_txn:5000000");
 CONF_Bool(enable_rate_limit, "true");
 CONF_Int64(bvar_qps_update_second, "5");
 
+// rate limit queue config
+CONF_mBool(enable_rate_limit_queue, "true");
+CONF_mInt64(rate_limit_queue_timeout_ms, "10000");
+// priority queue sizes
+CONF_mInt64(rate_limit_high_priority_queue_size, "2000");
+CONF_mInt64(rate_limit_normal_priority_queue_size, "3000");
+CONF_mInt64(rate_limit_low_priority_queue_size, "5000");
+// rate limit config sync interval (seconds)
+CONF_mInt64(rate_limit_config_sync_interval_s, "10");
+// rate limit preset: conservative, balanced, aggressive
+CONF_String(rate_limit_preset, "balanced");
+
 CONF_mInt32(copy_job_max_retention_second, "259200"); //3 * 24 * 3600 seconds
 CONF_String(arn_id, "");
 CONF_String(arn_ak, "");

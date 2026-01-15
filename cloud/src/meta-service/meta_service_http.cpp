@@ -460,6 +460,36 @@ static HttpResponse process_query_rate_limit(MetaServiceImpl* service, brpc::Con
     return http_json_reply(MetaServiceCode::OK, "", sb.GetString());
 }
 
+static HttpResponse process_query_queue_status(MetaServiceImpl* service, brpc::Controller*) {
+    auto rate_limiter = service->rate_limiter();
+    auto& queue_mgr = rate_limiter->queue_manager();
+    auto& stats = queue_mgr.stats();
+
+    rapidjson::Document d;
+    d.SetObject();
+
+    // Queue sizes by priority
+    rapidjson::Document queue_sizes;
+    queue_sizes.SetObject();
+    queue_sizes.AddMember("high", queue_mgr.queue_size(RequestPriority::HIGH), d.GetAllocator());
+    queue_sizes.AddMember("normal", queue_mgr.queue_size(RequestPriority::NORMAL), d.GetAllocator());
+    queue_sizes.AddMember("low", queue_mgr.queue_size(RequestPriority::LOW), d.GetAllocator());
+    d.AddMember("queue_sizes", queue_sizes, d.GetAllocator());
+
+    // Stats
+    rapidjson::Document stats_doc;
+    stats_doc.SetObject();
+    stats_doc.AddMember("total_queued", stats.total_queued.load(), d.GetAllocator());
+    stats_doc.AddMember("total_timeout", stats.total_timeout.load(), d.GetAllocator());
+    stats_doc.AddMember("total_rejected", stats.total_rejected.load(), d.GetAllocator());
+    d.AddMember("stats", stats_doc, d.GetAllocator());
+
+    rapidjson::StringBuffer sb;
+    rapidjson::PrettyWriter<rapidjson::StringBuffer> writer(sb);
+    d.Accept(writer);
+    return http_json_reply(MetaServiceCode::OK, "", sb.GetString());
+}
+
 static HttpResponse process_update_config(MetaServiceImpl* service, brpc::Controller* cntl) {
     const auto& uri = cntl->http_request().uri();
     bool persist = (http_query(uri, "persist") == "true");
@@ -947,6 +977,7 @@ void MetaServiceImpl::http(::google::protobuf::RpcController* controller,
             {"alter_iam", process_alter_iam},
             {"adjust_rate_limit", process_adjust_rate_limit},
             {"list_rate_limit", process_query_rate_limit},
+            {"queue_status", process_query_queue_status},
             {"update_config", process_update_config},
             {"v1/abort_txn", process_abort_txn},
             {"v1/abort_tablet_job", process_abort_tablet_job},
@@ -954,6 +985,7 @@ void MetaServiceImpl::http(::google::protobuf::RpcController* controller,
             {"v1/alter_iam", process_alter_iam},
             {"v1/adjust_rate_limit", process_adjust_rate_limit},
             {"v1/list_rate_limit", process_query_rate_limit},
+            {"v1/queue_status", process_query_queue_status},
             {"v1/update_config", process_update_config},
     };
 

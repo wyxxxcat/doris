@@ -37,6 +37,7 @@
 #include "meta-store/keys.h"
 #include "meta-store/txn_kv.h"
 #include "meta-store/txn_kv_error.h"
+#include "rate-limiter/rate_limiter.h"
 #include "resource-manager/resource_manager.h"
 
 namespace doris::cloud {
@@ -336,15 +337,25 @@ inline MetaServiceCode cast_as(TxnErrorCode code) {
 
 #define RPC_RATE_LIMIT(func_name)                                                            \
     if (config::enable_rate_limit && config::use_detailed_metrics && !instance_id.empty()) { \
-        auto rate_limiter = rate_limiter_->get_rpc_rate_limiter(#func_name);                 \
-        assert(rate_limiter != nullptr);                                                     \
+        auto rpc_limiter = rate_limiter_->get_rpc_rate_limiter(#func_name);                  \
+        assert(rpc_limiter != nullptr);                                                      \
         std::function<int()> get_bvar_qps = [&] {                                            \
             return g_bvar_ms_##func_name.get(instance_id)->qps();                            \
         };                                                                                   \
-        if (!rate_limiter->get_qps_token(instance_id, get_bvar_qps)) {                       \
+        auto check_under_limit = [&]() {                                                     \
+            return rpc_limiter->get_qps_token(instance_id, get_bvar_qps);                    \
+        };                                                                                   \
+        auto priority = RateLimiter::get_rpc_priority(#func_name);                           \
+        auto result = rate_limiter_->queue_manager().try_acquire(priority, check_under_limit); \
+        if (result == RateLimitResult::TIMEOUT) {                                            \
             drop_request = true;                                                             \
             code = MetaServiceCode::MAX_QPS_LIMIT;                                           \
-            msg = "reach max qps limit";                                                     \
+            msg = "rate limit queue timeout";                                                \
+            return;                                                                          \
+        } else if (result == RateLimitResult::REJECTED) {                                    \
+            drop_request = true;                                                             \
+            code = MetaServiceCode::MAX_QPS_LIMIT;                                           \
+            msg = "rate limit queue full, rejected";                                         \
             return;                                                                          \
         }                                                                                    \
     }

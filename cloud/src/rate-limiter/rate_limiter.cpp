@@ -34,6 +34,31 @@
 
 namespace doris::cloud {
 
+// RPC priority mapping
+static const std::unordered_map<std::string, RequestPriority> RPC_PRIORITY_MAP = {
+        // High priority - Query related
+        {"get_version", RequestPriority::HIGH},
+        {"get_tablet", RequestPriority::HIGH},
+        {"get_rowset", RequestPriority::HIGH},
+        {"get_tablet_stats", RequestPriority::HIGH},
+        {"get_delete_bitmap", RequestPriority::HIGH},
+        {"get_cluster", RequestPriority::HIGH},
+        // Low priority - Import related
+        {"prepare_rowset", RequestPriority::LOW},
+        {"commit_rowset", RequestPriority::LOW},
+        {"update_delete_bitmap", RequestPriority::LOW},
+        {"create_tablets", RequestPriority::LOW},
+        {"update_tablet", RequestPriority::LOW},
+};
+
+RequestPriority RateLimiter::get_rpc_priority(const std::string& rpc_name) {
+    auto it = RPC_PRIORITY_MAP.find(rpc_name);
+    if (it != RPC_PRIORITY_MAP.end()) {
+        return it->second;
+    }
+    return RequestPriority::NORMAL;
+}
+
 std::unordered_map<std::string, int64_t> parse_specific_qps_limit(const std::string& list_str) {
     std::unordered_map<std::string, int64_t> rpc_name_to_max_qps_limit;
     std::vector<std::string> max_qps_limit_list;
@@ -203,6 +228,82 @@ bool RpcRateLimiter::QpsToken::get_token(std::function<int()>& get_bvar_qps) {
 void RpcRateLimiter::QpsToken::set_max_qps_limit(int64_t max_qps_limit) {
     std::lock_guard<bthread::Mutex> l(mutex_);
     max_qps_limit_ = max_qps_limit;
+}
+
+//==============================================================================
+// PriorityQueueManager Implementation
+//==============================================================================
+
+PriorityQueueManager::PriorityQueueManager() = default;
+
+int64_t PriorityQueueManager::max_queue_size(RequestPriority priority) const {
+    switch (priority) {
+    case RequestPriority::HIGH:
+        return config::rate_limit_high_priority_queue_size;
+    case RequestPriority::NORMAL:
+        return config::rate_limit_normal_priority_queue_size;
+    case RequestPriority::LOW:
+        return config::rate_limit_low_priority_queue_size;
+    default:
+        return config::rate_limit_normal_priority_queue_size;
+    }
+}
+
+RateLimitResult PriorityQueueManager::try_acquire(RequestPriority priority,
+                                                   std::function<bool()> check_under_limit) {
+    // Fast path: check if under limit
+    if (check_under_limit()) {
+        return RateLimitResult::OK;
+    }
+
+    // Queue disabled, reject directly
+    if (!config::enable_rate_limit_queue) {
+        stats_.total_rejected.fetch_add(1, std::memory_order_relaxed);
+        return RateLimitResult::REJECTED;
+    }
+
+    auto idx = static_cast<size_t>(priority);
+    auto& slot = slots_[idx];
+    auto max_size = max_queue_size(priority);
+
+    // Check if queue is full
+    if (slot.queue_size.load(std::memory_order_relaxed) >= max_size) {
+        stats_.total_rejected.fetch_add(1, std::memory_order_relaxed);
+        return RateLimitResult::REJECTED;
+    }
+
+    // Enter queue
+    slot.queue_size.fetch_add(1, std::memory_order_relaxed);
+    stats_.total_queued.fetch_add(1, std::memory_order_relaxed);
+
+    auto timeout_us = config::rate_limit_queue_timeout_ms * 1000;
+
+    std::unique_lock<bthread::Mutex> lock(mutex_);
+    while (!check_under_limit()) {
+        if (slot.cv.wait_for(lock, timeout_us) == ETIMEDOUT) {
+            slot.queue_size.fetch_sub(1, std::memory_order_relaxed);
+            stats_.total_timeout.fetch_add(1, std::memory_order_relaxed);
+            return RateLimitResult::TIMEOUT;
+        }
+    }
+
+    slot.queue_size.fetch_sub(1, std::memory_order_relaxed);
+    return RateLimitResult::QUEUED;
+}
+
+void PriorityQueueManager::notify_one() {
+    // Notify high priority first
+    for (auto& slot : slots_) {
+        if (slot.queue_size.load(std::memory_order_relaxed) > 0) {
+            slot.cv.notify_one();
+            return;
+        }
+    }
+}
+
+int64_t PriorityQueueManager::queue_size(RequestPriority priority) const {
+    auto idx = static_cast<size_t>(priority);
+    return slots_[idx].queue_size.load(std::memory_order_relaxed);
 }
 
 } // namespace doris::cloud

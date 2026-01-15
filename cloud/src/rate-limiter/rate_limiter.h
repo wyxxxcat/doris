@@ -18,9 +18,11 @@
 #pragma once
 
 #include <brpc/server.h>
+#include <bthread/condition_variable.h>
 #include <bthread/mutex.h>
 #include <google/protobuf/service.h>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <shared_mutex>
@@ -32,7 +34,63 @@
 
 namespace doris::cloud {
 
+// Request priority levels
+enum class RequestPriority : int {
+    HIGH = 0,   // Query requests (get_version, get_tablet, etc.)
+    NORMAL = 1, // Normal requests
+    LOW = 2,    // Import requests (prepare_rowset, commit_rowset, etc.)
+};
+
+constexpr size_t REQUEST_PRIORITY_COUNT = 3;
+
+// Result of trying to get a rate limit token
+enum class RateLimitResult {
+    OK,       // Got token immediately
+    QUEUED,   // Got token after queuing
+    TIMEOUT,  // Queue timeout
+    REJECTED  // Queue full, rejected
+};
+
 class RpcRateLimiter;
+class PriorityQueueManager;
+
+// Priority queue manager for rate limiting
+class PriorityQueueManager {
+public:
+    struct Stats {
+        std::atomic<int64_t> total_queued{0};
+        std::atomic<int64_t> total_timeout{0};
+        std::atomic<int64_t> total_rejected{0};
+    };
+
+    PriorityQueueManager();
+    ~PriorityQueueManager() = default;
+
+    // Try to enter queue, wait if over limit
+    RateLimitResult try_acquire(RequestPriority priority,
+                                std::function<bool()> check_under_limit);
+
+    // Notify waiting requests
+    void notify_one();
+
+    // Get current queue size for a priority
+    int64_t queue_size(RequestPriority priority) const;
+
+    // Get stats
+    const Stats& stats() const { return stats_; }
+
+private:
+    struct PrioritySlot {
+        std::atomic<int64_t> queue_size{0};
+        bthread::ConditionVariable cv;
+    };
+
+    std::array<PrioritySlot, REQUEST_PRIORITY_COUNT> slots_;
+    bthread::Mutex mutex_;
+    Stats stats_;
+
+    int64_t max_queue_size(RequestPriority priority) const;
+};
 
 class RateLimiter {
 public:
@@ -51,21 +109,21 @@ public:
     void for_each_rpc_limiter(
             std::function<void(std::string_view, std::shared_ptr<RpcRateLimiter>)> cb);
 
-    /** 
+    /**
      * @brief set global default rate limit, will not infulence rpc and instance specific qps limit setting
      *
      * @return true if set sucessfully
      */
     bool set_rate_limit(int64_t qps_limit);
 
-    /** 
-     * @brief set rpc level rate limit, will not infulence instance specific qps limit setting 
+    /**
+     * @brief set rpc level rate limit, will not infulence instance specific qps limit setting
      *
      * @return true if set sucessfully
      */
     bool set_rate_limit(int64_t qps_limit, const std::string& rpc_name);
 
-    /** 
+    /**
      * @brief set instance level rate limit for specific rpc
      *
      * @return true if set sucessfully
@@ -73,12 +131,22 @@ public:
     bool set_rate_limit(int64_t qps_limit, const std::string& rpc_name,
                         const std::string& instance_id);
 
-    /** 
-     * @brief set instance level rate limit globally, will influence settings for the same instance of specific rpc 
-     * 
+    /**
+     * @brief set instance level rate limit globally, will influence settings for the same instance of specific rpc
+     *
      * @return true if set sucessfully
      */
     bool set_instance_rate_limit(int64_t qps_limit, const std::string& instance_id);
+
+    /**
+     * @brief Get the priority for a given RPC name
+     */
+    static RequestPriority get_rpc_priority(const std::string& rpc_name);
+
+    /**
+     * @brief Get the priority queue manager
+     */
+    PriorityQueueManager& queue_manager() { return queue_manager_; }
 
 private:
     // rpc_name -> RpcRateLimiter
@@ -86,6 +154,7 @@ private:
     // rpc names which specific limit have been set
     std::unordered_set<std::string> rpc_with_specific_limit_;
     bthread::Mutex mutex_;
+    PriorityQueueManager queue_manager_;
 };
 
 class RpcRateLimiter {
