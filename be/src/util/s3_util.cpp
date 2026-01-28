@@ -34,6 +34,7 @@
 #include <util/string_util.h>
 
 #include <atomic>
+#include <chrono>
 
 #ifdef USE_AZURE
 #include <azure/core/diagnostics/logger.hpp>
@@ -272,23 +273,34 @@ std::shared_ptr<io::ObjStorageClient> S3ClientFactory::create(const S3ClientConf
     }
 #endif
 
+    uint64_t hash = s3_conf.get_hash();
+    LOG(INFO) << "create s3 client with hash: " << hash;
+
     {
-        uint64_t hash = s3_conf.get_hash();
         std::lock_guard l(_lock);
         auto it = _cache.find(hash);
         if (it != _cache.end()) {
-            return it->second;
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed =
+                    std::chrono::duration_cast<std::chrono::seconds>(now - it->second.create_time);
+            if (elapsed < static_cast<std::chrono::seconds>(config::s3_client_cache_ttl_seconds)) {
+                TEST_SYNC_POINT("S3ClientFactory::create_with_cache");
+                return it->second.client;
+            }
         }
     }
 
     auto obj_client = (s3_conf.provider == io::ObjStorageType::AZURE)
                               ? _create_azure_client(s3_conf)
                               : _create_s3_client(s3_conf);
+    TEST_SYNC_POINT("S3ClientFactory::create_without_cache");
 
     {
-        uint64_t hash = s3_conf.get_hash();
         std::lock_guard l(_lock);
-        _cache[hash] = obj_client;
+        _cache[hash] = CachedClient {
+                .client = obj_client,
+                .create_time = std::chrono::steady_clock::now(),
+        };
     }
     return obj_client;
 }

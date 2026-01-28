@@ -2445,4 +2445,77 @@ TEST_F(S3FileSystemTest, DynamicUpdateRateLimiterConfig) {
               new_s3_get_token_per_second_val);
 }
 
+TEST_F(S3FileSystemTest, S3ClientCacheExpiration) {
+    // Save original config value
+    int64_t original_cache_ttl = config::s3_client_cache_ttl_seconds;
+
+    std::cout << "Testing S3 client cache expiration mechanism" << std::endl;
+    std::cout << "Original cache TTL: " << original_cache_ttl << " seconds" << std::endl;
+
+    // Set cache TTL to 5 seconds for testing
+    config::s3_client_cache_ttl_seconds = 5;
+    std::cout << "Set cache TTL to 5 seconds for testing" << std::endl;
+
+    // Setup sync points to track cache hits
+    bool first_create_from_cache = false;
+    bool second_create_from_cache = false;
+    auto *sp = SyncPoint::get_instance();
+
+    sp->set_call_back("S3ClientFactory::create_with_cache",
+                      [&](auto&& args) { first_create_from_cache = true; });
+
+    sp->set_call_back("S3ClientFactory::create_without_cache",
+                      [&](auto&& args) { first_create_from_cache = false; });
+
+    sp->enable_processing();
+
+    // First creation - should use cached client from SetUp()
+    std::cout << "Creating first S3 client (should use cache from SetUp)..." << std::endl;
+    auto st1 = create_client();
+    ASSERT_TRUE(st1.ok()) << "Failed to create first client: " << st1.to_string();
+    EXPECT_TRUE(first_create_from_cache) << "First client should be from cache (created in SetUp)";
+    std::cout << "First client retrieved from cache successfully" << std::endl;
+
+    // Second creation immediately - should also use cached client
+    std::cout << "Creating second S3 client immediately (should also use cache)..." << std::endl;
+    first_create_from_cache = false; // Reset flag
+    auto st2 = create_client();
+    ASSERT_TRUE(st2.ok()) << "Failed to create second client: " << st2.to_string();
+    EXPECT_TRUE(first_create_from_cache) << "Second client should be from cache";
+    std::cout << "Second client retrieved from cache successfully" << std::endl;
+
+    // Wait for cache to expire (5 seconds + small buffer)
+    std::cout << "Waiting 6 seconds for cache to expire..." << std::endl;
+    std::this_thread::sleep_for(std::chrono::seconds(6));
+    std::cout << "Cache should now be expired" << std::endl;
+
+    // Setup sync point for third creation
+    sp->clear_call_back("S3ClientFactory::create_with_cache");
+    sp->clear_call_back("S3ClientFactory::create_without_cache");
+
+    sp->set_call_back("S3ClientFactory::create_with_cache",
+                      [&](auto&& args) { second_create_from_cache = true; });
+
+    sp->set_call_back("S3ClientFactory::create_without_cache",
+                      [&](auto&& args) { second_create_from_cache = false; });
+
+    // Third creation after expiration - should create a new client (not from cache)
+    std::cout << "Creating third S3 client after expiration..." << std::endl;
+    auto st3 = create_client();
+    ASSERT_TRUE(st3.ok()) << "Failed to create third client: " << st3.to_string();
+    EXPECT_FALSE(second_create_from_cache)
+            << "Third client should not be from cache (cache expired)";
+    std::cout << "Third client created successfully (cache expired, new client created)"
+              << std::endl;
+
+    // Cleanup
+    sp->disable_processing();
+    sp->clear_all_call_backs();
+
+    // Restore original config
+    config::s3_client_cache_ttl_seconds = original_cache_ttl;
+    std::cout << "Restored cache TTL to: " << original_cache_ttl << " seconds" << std::endl;
+    std::cout << "S3 client cache expiration test completed successfully!" << std::endl;
+}
+
 } // namespace doris

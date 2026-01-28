@@ -132,6 +132,11 @@ struct S3Conf {
     }
 };
 
+struct CachedClient {
+    std::shared_ptr<io::ObjStorageClient> client;
+    std::chrono::steady_clock::time_point create_time;
+};
+
 class S3ClientFactory {
 public:
     ~S3ClientFactory();
@@ -178,7 +183,7 @@ private:
 
     Aws::SDKOptions _aws_options;
     std::mutex _lock;
-    std::unordered_map<uint64_t, std::shared_ptr<io::ObjStorageClient>> _cache;
+    std::unordered_map<uint64_t, CachedClient> _cache;
     std::string _ca_cert_file_path;
     std::array<std::unique_ptr<S3RateLimiterHolder>, 2> _rate_limiters;
 #ifdef BE_TEST

@@ -1532,6 +1532,7 @@ DECLARE_mInt64(s3_put_token_per_second);
 DECLARE_mInt64(s3_put_token_limit);
 // max s3 client retry times
 DECLARE_mInt32(max_s3_client_retry);
+DECLARE_mInt32(s3_client_cache_ttl_seconds);
 // When meet s3 429 error, the "get" request will
 // sleep s3_read_base_wait_time_ms (*1, *2, *3, *4) ms
 // get try again.
