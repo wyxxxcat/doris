@@ -4455,7 +4455,7 @@ int InstanceRecycler::recycle_rowsets() {
 
     int64_t start_time = duration_cast<seconds>(steady_clock::now().time_since_epoch()).count();
     register_recycle_task(task_name, start_time);
-
+    // codex auto review
     DORIS_CLOUD_DEFER {
         unregister_recycle_task(task_name);
         int64_t cost =
