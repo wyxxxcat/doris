@@ -8551,4 +8551,102 @@ TEST(RecyclerTest, recycle_tablet_with_delete_file_failure) {
         EXPECT_EQ(it->size(), 0) << "All recycle rowset keys should be deleted";
     }
 }
+
+TEST(RecyclerTest, recycle_tablets_range_remove_skip_tablet_repro) {
+    // Repro for potential range-remove bug:
+    // t1 and t3 recycle successfully, t2 is skipped by check_lazy_txn_finished.
+    // loop_done() may still range-remove [t1, t3], and unexpectedly delete t2 meta.
+    auto* sp = SyncPoint::get_instance();
+    std::atomic<int> txn_not_finished_hits {0};
+    sp->set_call_back("check_lazy_txn_finished::txn_not_finished",
+                      [&txn_not_finished_hits](auto&&) {
+                          txn_not_finished_hits.fetch_add(1, std::memory_order_relaxed);
+                      });
+    sp->enable_processing();
+    DORIS_CLOUD_DEFER {
+        sp->clear_all_call_backs();
+        sp->clear_trace();
+        sp->disable_processing();
+    };
+
+    auto txn_kv = std::make_shared<MemTxnKv>();
+    ASSERT_EQ(txn_kv->init(), 0);
+
+    InstanceInfoPB instance;
+    instance.set_instance_id(::instance_id);
+    auto obj_info = instance.add_obj_info();
+    obj_info->set_id("recycle_tablets_range_remove_skip_tablet_repro");
+    obj_info->set_ak(config::test_s3_ak);
+    obj_info->set_sk(config::test_s3_sk);
+    obj_info->set_endpoint(config::test_s3_endpoint);
+    obj_info->set_region(config::test_s3_region);
+    obj_info->set_bucket(config::test_s3_bucket);
+    obj_info->set_prefix("recycle_tablets_range_remove_skip_tablet_repro");
+
+    InstanceRecycler recycler(txn_kv, instance, thread_group,
+                              std::make_shared<TxnLazyCommitter>(txn_kv));
+    ASSERT_EQ(recycler.init(), 0);
+
+    constexpr int64_t table_id = 30100;
+    constexpr int64_t index_id = 30101;
+    constexpr int64_t partition1 = 30111;
+    constexpr int64_t partition2 = 30112;
+    constexpr int64_t partition3 = 30113;
+    constexpr int64_t tablet1 = 30201;
+    constexpr int64_t tablet2 = 30202;
+    constexpr int64_t tablet3 = 30203;
+
+    ASSERT_EQ(create_tablet(txn_kv.get(), table_id, index_id, partition1, tablet1), 0);
+    ASSERT_EQ(create_tablet(txn_kv.get(), table_id, index_id, partition2, tablet2), 0);
+    ASSERT_EQ(create_tablet(txn_kv.get(), table_id, index_id, partition3, tablet3), 0);
+    ASSERT_EQ(create_partition_version_kv(txn_kv.get(), table_id, partition1), 0);
+    ASSERT_EQ(create_partition_version_kv(txn_kv.get(), table_id, partition3), 0);
+
+    // Make tablet2 fail lazy-txn check by setting pending_txn_ids for its partition version.
+    {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+        VersionPB version_pb;
+        version_pb.set_version(1);
+        version_pb.add_pending_txn_ids(999999);
+        txn->put(partition_version_key({::instance_id, db_id, table_id, partition2}),
+                 version_pb.SerializeAsString());
+        ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+    }
+
+    // Sanity check: tablet2 meta exists before recycle.
+    {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+        std::string val;
+        ASSERT_EQ(
+                txn->get(meta_tablet_key({::instance_id, table_id, index_id, partition2, tablet2}),
+                         &val),
+                TxnErrorCode::TXN_OK);
+    }
+
+    EXPECT_EQ(recycler.recycle_tablets(table_id, index_id, ctx), -1);
+    EXPECT_GT(txn_not_finished_hits.load(), 0);
+
+    // Repro result:
+    // tablet2 is skipped (lazy txn not finished), but tablet2 meta may still be deleted
+    // by range-remove between tablet1 and tablet3.
+    std::unique_ptr<Transaction> txn;
+    ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+    std::string val;
+
+    EXPECT_EQ(txn->get(meta_tablet_key({::instance_id, table_id, index_id, partition1, tablet1}),
+                       &val),
+              TxnErrorCode::TXN_KEY_NOT_FOUND);
+    EXPECT_EQ(txn->get(meta_tablet_key({::instance_id, table_id, index_id, partition3, tablet3}),
+                       &val),
+              TxnErrorCode::TXN_KEY_NOT_FOUND);
+
+    EXPECT_EQ(txn->get(meta_tablet_key({::instance_id, table_id, index_id, partition2, tablet2}),
+                       &val),
+              TxnErrorCode::TXN_KEY_NOT_FOUND)
+            << "Repro bug: skipped tablet meta is unexpectedly deleted by range remove";
+    EXPECT_EQ(txn->get(meta_tablet_idx_key({::instance_id, tablet2}), &val), TxnErrorCode::TXN_OK)
+            << "tablet2 idx key remains, showing KV inconsistency";
+}
 } // namespace doris::cloud

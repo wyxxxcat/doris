@@ -3467,4 +3467,181 @@ TEST(TxnLazyCommitTest, CommitTxnEventuallyWithManyPartitions) {
     }
 }
 
+TEST(TxnLazyCommitTest, recycle_tablet_with_pending_lazy_txn) {
+    // Test scenario: A lazy commit txn is pending (not finished yet),
+    // and recycle_tablets() is called. The tablet should NOT be recycled
+    // because the lazy txn is still running, otherwise rowset data in object
+    // storage may leak.
+    constexpr int64_t db_id = 15246789;
+    const std::string mock_instance = "test_instance";
+    RecyclerMetricsContext metrics_context;
+    auto txn_kv = std::make_shared<MemTxnKv>();
+    ASSERT_EQ(txn_kv->init(), 0);
+
+    std::atomic<bool> recycle_done {false};
+    std::atomic<bool> lazy_commit_started {false};
+    auto sp = SyncPoint::get_instance();
+
+    // Force lazy commit even with single tablet
+    sp->set_call_back("commit_txn::force_txn_lazy_commit", [](auto&& args) {
+        bool* force = try_any_cast<bool*>(args[0]);
+        *force = true;
+    });
+
+    sp->set_call_back("TxnLazyCommitter::commit", [&](auto&&) {
+        lazy_commit_started.store(true);
+        while (!recycle_done.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    });
+    sp->enable_processing();
+    DORIS_CLOUD_DEFER {
+        sp->clear_all_call_backs();
+        sp->clear_trace();
+        sp->disable_processing();
+    };
+
+    auto meta_service = get_meta_service(txn_kv, true);
+
+    constexpr int64_t table_id = 40100;
+    constexpr int64_t index_id = 40101;
+    constexpr int64_t partition1 = 40111;
+    constexpr int64_t partition_base = 40112; // partition2 to partition2002
+    constexpr int64_t partition2003 = 43113;
+    constexpr int64_t tablet1 = 40201;
+    constexpr int64_t tablet_base = 40202; // tablet2 to tablet2002
+    constexpr int64_t tablet2003 = 43203;
+
+    // Create 2003 tablets in different partitions
+    create_tablet_with_db_id(meta_service.get(), db_id, table_id, index_id, partition1, tablet1);
+    for (int i = 0; i < 2001; ++i) {
+        create_tablet_with_db_id(meta_service.get(), db_id, table_id, index_id, partition_base + i,
+                                 tablet_base + i);
+    }
+    create_tablet_with_db_id(meta_service.get(), db_id, table_id, index_id, partition2003,
+                             tablet2003);
+
+    // Begin a lazy commit transaction only for tablet2
+    brpc::Controller cntl;
+    BeginTxnRequest begin_req;
+    begin_req.set_cloud_unique_id("test_cloud_unique_id");
+    TxnInfoPB txn_info_pb;
+    txn_info_pb.set_db_id(db_id);
+    txn_info_pb.set_label("test_recycle_with_lazy_txn");
+    txn_info_pb.add_table_ids(table_id);
+    txn_info_pb.set_timeout_ms(60000000);
+    begin_req.mutable_txn_info()->CopyFrom(txn_info_pb);
+    BeginTxnResponse begin_res;
+    meta_service->begin_txn(reinterpret_cast<::google::protobuf::RpcController*>(&cntl), &begin_req,
+                            &begin_res, nullptr);
+    ASSERT_EQ(begin_res.status().code(), MetaServiceCode::OK);
+    int64_t txn_id = begin_res.txn_id();
+
+    // Create and commit one rowset for each tablet (tablet2-tablet2002)
+    for (int i = 0; i < 2001; ++i) {
+        auto tmp_rowset = create_rowset(txn_id, tablet_base + i, index_id, partition_base + i);
+        CreateRowsetResponse rowset_res;
+        prepare_rowset(meta_service.get(), tmp_rowset, rowset_res);
+        ASSERT_EQ(rowset_res.status().code(), MetaServiceCode::OK);
+        commit_rowset(meta_service.get(), tmp_rowset, rowset_res);
+        ASSERT_EQ(rowset_res.status().code(), MetaServiceCode::OK);
+    }
+
+    // Commit txn with lazy commit enabled (but don't wait for it to finish)
+    std::thread commit_thread([&]() {
+        brpc::Controller cntl2;
+        CommitTxnRequest commit_req;
+        commit_req.set_cloud_unique_id("test_cloud_unique_id");
+        commit_req.set_db_id(db_id);
+        commit_req.set_txn_id(txn_id);
+        commit_req.set_is_2pc(false);
+        commit_req.set_enable_txn_lazy_commit(true);
+        CommitTxnResponse commit_res;
+        meta_service->commit_txn(reinterpret_cast<::google::protobuf::RpcController*>(&cntl2),
+                                 &commit_req, &commit_res, nullptr);
+        ASSERT_EQ(commit_res.status().code(), MetaServiceCode::OK);
+    });
+
+    // At this point, the lazy commit task is running but not finished yet
+    // The partition version should have pending_txn_ids
+
+    // Setup recycler
+    InstanceInfoPB instance;
+    instance.set_instance_id(mock_instance);
+    auto obj_info = instance.add_obj_info();
+    obj_info->set_id("recycle_tablet_with_pending_lazy_txn");
+    obj_info->set_ak(config::test_s3_ak);
+    obj_info->set_sk(config::test_s3_sk);
+    obj_info->set_endpoint(config::test_s3_endpoint);
+    obj_info->set_region(config::test_s3_region);
+    obj_info->set_bucket(config::test_s3_bucket);
+    obj_info->set_prefix("recycle_tablet_with_pending_lazy_txn");
+
+    InstanceRecycler recycler(txn_kv, instance, thread_group,
+                              std::make_shared<TxnLazyCommitter>(txn_kv));
+    ASSERT_EQ(recycler.init(), 0);
+
+    // Wait for lazy commit task to start
+    for (size_t i = 0; i < 100; i++) {
+        if (lazy_commit_started.load()) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(lazy_commit_started.load()) << "Lazy commit task should have started";
+
+    // Try to recycle tablets - should fail because lazy txn is not finished
+    EXPECT_EQ(recycler.recycle_tablets(table_id, index_id, metrics_context), -1);
+
+    // Signal lazy commit to continue
+    recycle_done.store(true);
+
+    // Wait for commit thread to finish
+    commit_thread.join();
+
+    // Verify tablet1 and tablet2003 meta are deleted (no lazy txn)
+    {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+        std::string val;
+        EXPECT_EQ(
+                txn->get(meta_tablet_key({mock_instance, table_id, index_id, partition1, tablet1}),
+                         &val),
+                TxnErrorCode::TXN_KEY_NOT_FOUND)
+                << "Tablet1 should be deleted";
+        EXPECT_EQ(txn->get(meta_tablet_key(
+                                   {mock_instance, table_id, index_id, partition2003, tablet2003}),
+                           &val),
+                  TxnErrorCode::TXN_KEY_NOT_FOUND)
+                << "Tablet2003 should be deleted";
+    }
+
+    // Verify tablet2-tablet2002 meta were unexpectedly deleted by range-remove - this is the bug!
+    {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+        std::string val;
+        for (int i = 0; i < 2001; i++) {
+            EXPECT_EQ(txn->get(meta_tablet_key({mock_instance, table_id, index_id, partition_base,
+                                                tablet_base + i}),
+                               &val),
+                      TxnErrorCode::TXN_KEY_NOT_FOUND)
+                    << "BUG: Tablet2 meta was unexpectedly deleted by range-remove [tablet1, "
+                       "tablet2003]";
+        }
+    }
+
+    // Verify tablet2 idx still exists, showing KV inconsistency
+    {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+        std::string val;
+        for (int i = 0; i < 2001; i++) {
+            EXPECT_EQ(txn->get(meta_tablet_idx_key({mock_instance, tablet_base + i}), &val),
+                      TxnErrorCode::TXN_OK)
+                    << "Tablet2 idx remains, showing KV inconsistency";
+        }
+    }
+}
+
 } // namespace doris::cloud
