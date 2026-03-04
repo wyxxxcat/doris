@@ -311,6 +311,15 @@ inline MetaServiceCode cast_as(TxnErrorCode code) {
     [[maybe_unused]] std::string instance_id;                                                 \
     [[maybe_unused]] bool drop_request = false;                                               \
     [[maybe_unused]] KVStats stats;                                                           \
+    if (g_bvar_fdb_performance_limited_by_name.get_value() == -1) {                           \
+        drop_request = true;                                                                  \
+        code = MetaServiceCode::MS_RATE_LIMIT;                                                \
+        msg = "meta service rate limited";                                                    \
+        response->mutable_status()->set_code(code);                                           \
+        response->mutable_status()->set_msg(msg);                                             \
+        finish_rpc(#func_name, ctrl, request, response);                                      \
+        return;                                                                               \
+    }                                                                                         \
     DORIS_CLOUD_DEFER {                                                                       \
         response->mutable_status()->set_code(code);                                           \
         response->mutable_status()->set_msg(msg);                                             \
