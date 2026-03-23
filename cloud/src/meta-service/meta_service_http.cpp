@@ -48,6 +48,7 @@
 #include "common/logging.h"
 #include "common/string_util.h"
 #include "meta-service/meta_service_helper.h"
+#include "meta-service/meta_service_rate_limit_helper.h"
 #include "meta-store/txn_kv.h"
 #include "meta-store/txn_kv_error.h"
 #include "meta_service.h"
@@ -637,6 +638,53 @@ static HttpResponse process_get_tablet_stats(MetaServiceImpl* service, brpc::Con
     return http_text_reply(resp.status(), body);
 }
 
+static HttpResponse process_set_rpc_rate_limit_whitelist(MetaServiceImpl*, brpc::Controller* ctrl) {
+    rapidjson::Document doc;
+    std::string body = ctrl->request_attachment().to_string();
+    doc.Parse(body.c_str());
+
+    if (doc.HasParseError()) {
+        return http_json_reply(MetaServiceCode::INVALID_ARGUMENT,
+                               fmt::format("parse json failed: {}",
+                                           rapidjson::GetParseError_En(doc.GetParseError())));
+    }
+
+    if (!doc.IsObject() || !doc.HasMember("rpcs") || !doc["rpcs"].IsArray()) {
+        return http_json_reply(MetaServiceCode::INVALID_ARGUMENT,
+                               "invalid request, need {\"rpcs\": [\"rpc1\", \"rpc2\"]}");
+    }
+
+    std::vector<std::string> rpcs;
+    for (auto& rpc : doc["rpcs"].GetArray()) {
+        if (rpc.IsString()) {
+            rpcs.emplace_back(rpc.GetString());
+        }
+    }
+
+    RpcRateLimitWhitelist::instance().set_whitelist(rpcs);
+    return http_json_reply(MetaServiceCode::OK, "success");
+}
+
+static HttpResponse process_get_rpc_rate_limit_whitelist(MetaServiceImpl*, brpc::Controller*) {
+    auto rpcs = RpcRateLimitWhitelist::instance().get_whitelist();
+
+    rapidjson::Document doc;
+    doc.SetObject();
+    auto& allocator = doc.GetAllocator();
+
+    rapidjson::Value rpc_array(rapidjson::kArrayType);
+    for (const auto& rpc : rpcs) {
+        rpc_array.PushBack(rapidjson::Value(rpc.c_str(), allocator), allocator);
+    }
+    doc.AddMember("rpcs", rpc_array, allocator);
+
+    rapidjson::StringBuffer buffer;
+    rapidjson::PrettyWriter<rapidjson::StringBuffer> writer(buffer);
+    doc.Accept(writer);
+
+    return http_json_reply(MetaServiceCode::OK, "success", buffer.GetString());
+}
+
 static HttpResponse process_fix_tablet_stats(MetaServiceImpl* service, brpc::Controller* ctrl) {
     auto& uri = ctrl->http_request().uri();
     std::string_view cloud_unique_id = http_query(uri, "cloud_unique_id");
@@ -1003,6 +1051,11 @@ void MetaServiceImpl::http(::google::protobuf::RpcController* controller,
             {"v1/get_tablet_stats", process_get_tablet_stats},
             {"v1/get_stage", process_get_stage},
             {"v1/get_cluster_status", process_get_cluster_status},
+            // rate limit whitelist
+            {"set_rpc_rate_limit_whitelist", process_set_rpc_rate_limit_whitelist},
+            {"get_rpc_rate_limit_whitelist", process_get_rpc_rate_limit_whitelist},
+            {"v1/set_rpc_rate_limit_whitelist", process_set_rpc_rate_limit_whitelist},
+            {"v1/get_rpc_rate_limit_whitelist", process_get_rpc_rate_limit_whitelist},
             // snapshot related
             {"list_snapshot", process_list_snapshot},
             {"drop_snapshot", process_drop_snapshot},
