@@ -363,6 +363,12 @@ int decrypt_instance_info(InstanceInfoPB& instance, const std::string& instance_
 void notify_refresh_instance(std::shared_ptr<TxnKv> txn_kv, const std::string& instance_id,
                              KVStats* stats, bool include_self = false);
 
+bool get_tablet_idx_from_ms_cache(std::string_view instance_id, int64_t tablet_id,
+                                  TabletIndexPB* tablet_idx);
+
+void put_tablet_idx_to_ms_cache(std::string_view instance_id, int64_t tablet_id,
+                                const TabletIndexPB& tablet_idx);
+
 void get_tablet_idx(MetaServiceCode& code, std::string& msg, Transaction* txn,
                     const std::string& instance_id, int64_t tablet_id, TabletIndexPB& tablet_idx);
 
