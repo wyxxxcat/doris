@@ -1465,8 +1465,8 @@ TEST(MetaServiceHttpTest, GetTabletStatsTest) {
 TEST(MetaServiceHttpTest, ToUnknownUrlTest) {
     HttpContext ctx;
     auto [status_code, content] = ctx.query<std::string>("unkown_resource_xxxxxx", "");
-    ASSERT_EQ(status_code, 200);
-    ASSERT_EQ(content, "{\n    \"code\": \"OK\",\n    \"msg\": \"\"\n}\n");
+    ASSERT_EQ(status_code, 404);
+    ASSERT_EQ(content, "http path not found or not allowed\n");
 }
 
 TEST(MetaServiceHttpTest, UnknownFields) {
@@ -1888,7 +1888,7 @@ TEST(MetaServiceHttpTest, UpdateConfig) {
     {
         auto [status_code, content] = ctx.query<std::string>("update_config", "");
         ASSERT_EQ(status_code, 400);
-        std::string msg = "query param `config` should not be empty";
+        std::string msg = "query param `configs` should not be empty";
         ASSERT_NE(content.find(msg), std::string::npos);
     }
     {
