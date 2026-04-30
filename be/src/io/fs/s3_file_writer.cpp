@@ -41,6 +41,7 @@
 #include "io/fs/s3_file_system.h"
 #include "io/fs/s3_obj_storage_client.h"
 #include "runtime/exec_env.h"
+#include "util/debug_points.h"
 #include "util/s3_util.h"
 #include "util/stopwatch.hpp"
 
@@ -254,6 +255,12 @@ Status S3FileWriter::_build_upload_buffer() {
 
 Status S3FileWriter::_close_impl() {
     VLOG_DEBUG << "S3FileWriter::close, path: " << _obj_storage_path_opts.path.native();
+
+    DBUG_EXECUTE_IF("S3FileWriter._close_impl.inject_error", {
+        if (_obj_storage_path_opts.key.ends_with(".dat")) {
+            return Status::IOError("S3FileWriter._close_impl.inject_error");
+        }
+    });
 
     if (_cur_part_num == 1 && _pending_buf) { // data size is less than config::s3_write_buffer_size
         RETURN_IF_ERROR(_set_upload_to_remote_less_than_buffer_size());
