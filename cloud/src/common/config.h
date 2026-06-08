@@ -114,10 +114,12 @@ CONF_mInt32(instance_recycler_worker_pool_size, "32");
 // Max number of delete tasks per batch when recycling objects.
 // Each task deletes up to 1000 files. Controls memory usage during large-scale deletion.
 CONF_Int32(recycler_max_tasks_per_batch, "1000");
+// Deprecated compatibility aliases for existing deployments/tests.
 // Max expired recycle_rowset entries to process for one tablet in one recycle_rowsets scan.
 // Remaining entries are left for later scans so deletion can spread across tablet prefixes.
 CONF_mInt32(recycle_rowsets_per_tablet_batch_size, "1000");
-CONF_mInt32(recycle_rowsets_delete_batch_size, "300000");
+// Outstanding rowset contribution reserved by each grouped rowset delete task.
+CONF_mInt32(recycle_rowsets_estimated_delete_object_budget, "2000");
 // The worker pool size for http api `statistics_recycle` worker pool
 CONF_mInt32(instance_recycler_statistics_recycle_worker_pool_size, "5");
 CONF_Bool(enable_checker, "false");
@@ -147,6 +149,8 @@ CONF_mInt32(packed_file_txn_retry_times, "10");
 CONF_mInt64(packed_file_txn_retry_sleep_min_ms, "5");
 CONF_mInt64(packed_file_txn_retry_sleep_max_ms, "50");
 CONF_mInt32(recycle_txn_delete_max_retry_times, "10");
+CONF_mInt32(recycle_rowset_group_max_retry_times, "10");
+CONF_mInt64(recycle_rowset_group_retry_delay_seconds, "1");
 
 // force recycler to recycle all useless object.
 // **just for TEST**

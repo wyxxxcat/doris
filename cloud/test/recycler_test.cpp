@@ -31,13 +31,17 @@
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include "common/bvars.h"
 #include "common/config.h"
@@ -162,6 +166,331 @@ int main(int argc, char** argv) {
 }
 
 namespace doris::cloud {
+
+class GroupedRowsetDeleteExecutorConfigGuard {
+public:
+    GroupedRowsetDeleteExecutorConfigGuard()
+            : per_tablet_batch_size_(config::recycle_rowsets_per_tablet_batch_size),
+              delete_object_budget_(config::recycle_rowsets_estimated_delete_object_budget),
+              max_retry_times_(config::recycle_rowset_group_max_retry_times),
+              retry_delay_seconds_(config::recycle_rowset_group_retry_delay_seconds) {}
+
+    ~GroupedRowsetDeleteExecutorConfigGuard() {
+        config::recycle_rowsets_per_tablet_batch_size = per_tablet_batch_size_;
+        config::recycle_rowsets_estimated_delete_object_budget = delete_object_budget_;
+        config::recycle_rowset_group_max_retry_times = max_retry_times_;
+        config::recycle_rowset_group_retry_delay_seconds = retry_delay_seconds_;
+    }
+
+private:
+    int32_t per_tablet_batch_size_;
+    int32_t delete_object_budget_;
+    int32_t max_retry_times_;
+    int32_t retry_delay_seconds_;
+};
+
+static RowsetDeleteItem make_rowset_delete_item(int64_t tablet_id, int64_t rowset_id,
+                                                bool with_meta = false, int num_segments = 1,
+                                                int64_t index_disk_size = 0) {
+    RowsetDeleteItem item;
+    item.recycle_key = fmt::format("recycle_key_{}_{}", tablet_id, rowset_id);
+    item.rowset_id = std::to_string(rowset_id);
+    item.rowset.set_tablet_id(tablet_id);
+    if (with_meta) {
+        item.rowset.set_type(RecycleRowsetPB::COMPACT);
+        auto* rowset_meta = item.rowset.mutable_rowset_meta();
+        rowset_meta->set_tablet_id(tablet_id);
+        rowset_meta->set_rowset_id_v2(item.rowset_id);
+        rowset_meta->set_num_segments(num_segments);
+        rowset_meta->set_index_disk_size(index_disk_size);
+    }
+    return item;
+}
+
+TEST(RecyclerTest, grouped_rowset_delete_executor_keeps_same_tablet_in_one_group) {
+    GroupedRowsetDeleteExecutorConfigGuard guard;
+    config::recycle_rowsets_per_tablet_batch_size = 2;
+    config::recycle_rowsets_estimated_delete_object_budget = 100;
+
+    SimpleThreadPool worker_pool(1);
+    ASSERT_EQ(worker_pool.start(), 0);
+    DORIS_CLOUD_DEFER {
+        ASSERT_EQ(worker_pool.stop(), 0);
+    };
+
+    std::mutex mtx;
+    std::vector<std::vector<int64_t>> executed_rowsets;
+    GroupedRowsetDeleteExecutor executor(&worker_pool, [&](std::vector<RowsetDeleteItem> items) {
+        std::vector<int64_t> rowsets;
+        for (const auto& item : items) {
+            rowsets.push_back(std::stoll(item.rowset_id));
+            EXPECT_EQ(item.rowset.tablet_id(), 10001);
+        }
+        std::lock_guard lock(mtx);
+        executed_rowsets.push_back(std::move(rowsets));
+        return 0;
+    });
+
+    for (int i = 0; i < config::recycle_rowsets_per_tablet_batch_size * 3 + 5; ++i) {
+        executor.add(make_rowset_delete_item(10001, i));
+    }
+    executor.finish();
+
+    ASSERT_EQ(executed_rowsets.size(), 1);
+    EXPECT_EQ(executed_rowsets[0].size(), 11);
+}
+
+TEST(RecyclerTest, grouped_rowset_delete_executor_splits_different_tablets_by_capacity) {
+    GroupedRowsetDeleteExecutorConfigGuard guard;
+    config::recycle_rowsets_per_tablet_batch_size = 2;
+    config::recycle_rowsets_estimated_delete_object_budget = 100;
+
+    SimpleThreadPool worker_pool(1);
+    ASSERT_EQ(worker_pool.start(), 0);
+    DORIS_CLOUD_DEFER {
+        ASSERT_EQ(worker_pool.stop(), 0);
+    };
+
+    std::mutex mtx;
+    std::vector<std::vector<int64_t>> executed_tablets;
+    GroupedRowsetDeleteExecutor executor(&worker_pool, [&](std::vector<RowsetDeleteItem> items) {
+        std::vector<int64_t> tablets;
+        for (const auto& item : items) {
+            tablets.push_back(item.rowset.tablet_id());
+        }
+        std::lock_guard lock(mtx);
+        executed_tablets.push_back(std::move(tablets));
+        return 0;
+    });
+
+    int64_t rowset_id = 0;
+    for (int64_t tablet_id : {10001, 10002}) {
+        for (int i = 0; i < 3; ++i) {
+            executor.add(make_rowset_delete_item(tablet_id, rowset_id++));
+        }
+    }
+    executor.add(make_rowset_delete_item(10003, rowset_id++));
+    executor.finish();
+
+    ASSERT_EQ(executed_tablets.size(), 2);
+    ASSERT_EQ(executed_tablets[0].size(), 6);
+    EXPECT_EQ(executed_tablets[0][0], 10001);
+    EXPECT_EQ(executed_tablets[0][3], 10002);
+    ASSERT_EQ(executed_tablets[1].size(), 1);
+    EXPECT_EQ(executed_tablets[1][0], 10003);
+}
+
+TEST(RecyclerTest, grouped_rowset_delete_executor_flushes_last_tablet_on_finish) {
+    GroupedRowsetDeleteExecutorConfigGuard guard;
+    config::recycle_rowsets_per_tablet_batch_size = 10;
+    config::recycle_rowsets_estimated_delete_object_budget = 100;
+
+    SimpleThreadPool worker_pool(1);
+    ASSERT_EQ(worker_pool.start(), 0);
+    DORIS_CLOUD_DEFER {
+        ASSERT_EQ(worker_pool.stop(), 0);
+    };
+
+    std::atomic<int> executed_count = 0;
+    GroupedRowsetDeleteExecutor executor(&worker_pool, [&](std::vector<RowsetDeleteItem> items) {
+        EXPECT_EQ(items.size(), 2);
+        executed_count += items.size();
+        return 0;
+    });
+
+    executor.add(make_rowset_delete_item(10001, 1));
+    executor.add(make_rowset_delete_item(10001, 2));
+    executor.finish();
+
+    EXPECT_EQ(executed_count.load(), 2);
+}
+
+TEST(RecyclerTest, grouped_rowset_delete_executor_allows_single_tablet_over_capacity) {
+    GroupedRowsetDeleteExecutorConfigGuard guard;
+    config::recycle_rowsets_per_tablet_batch_size = 2;
+    config::recycle_rowsets_estimated_delete_object_budget = 100;
+
+    SimpleThreadPool worker_pool(1);
+    ASSERT_EQ(worker_pool.start(), 0);
+    DORIS_CLOUD_DEFER {
+        ASSERT_EQ(worker_pool.stop(), 0);
+    };
+
+    std::vector<size_t> executed_sizes;
+    GroupedRowsetDeleteExecutor executor(&worker_pool, [&](std::vector<RowsetDeleteItem> items) {
+        executed_sizes.push_back(items.size());
+        return 0;
+    });
+
+    for (int i = 0; i < 10; ++i) {
+        executor.add(make_rowset_delete_item(10001, i));
+    }
+    executor.finish();
+
+    ASSERT_EQ(executed_sizes.size(), 1);
+    EXPECT_EQ(executed_sizes[0], 10);
+}
+
+TEST(RecyclerTest, grouped_rowset_delete_executor_consumes_prefix_by_budget_and_remaining_group) {
+    GroupedRowsetDeleteExecutorConfigGuard guard;
+    config::recycle_rowsets_per_tablet_batch_size = 10;
+    config::recycle_rowsets_estimated_delete_object_budget = 2;
+
+    SimpleThreadPool worker_pool(1);
+    ASSERT_EQ(worker_pool.start(), 0);
+    DORIS_CLOUD_DEFER {
+        ASSERT_EQ(worker_pool.stop(), 0);
+    };
+
+    std::mutex mtx;
+    std::vector<std::vector<int64_t>> executed_rowsets;
+    GroupedRowsetDeleteExecutor executor(&worker_pool, [&](std::vector<RowsetDeleteItem> items) {
+        std::vector<int64_t> rowsets;
+        for (const auto& item : items) {
+            rowsets.push_back(std::stoll(item.rowset_id));
+        }
+        std::lock_guard lock(mtx);
+        executed_rowsets.push_back(std::move(rowsets));
+        return 0;
+    });
+
+    for (int i = 0; i < 5; ++i) {
+        executor.add(make_rowset_delete_item(10001, i));
+    }
+    executor.finish();
+
+    ASSERT_EQ(executed_rowsets.size(), 3);
+    EXPECT_EQ(executed_rowsets[0], (std::vector<int64_t> {0, 1}));
+    EXPECT_EQ(executed_rowsets[1], (std::vector<int64_t> {2, 3}));
+    EXPECT_EQ(executed_rowsets[2], (std::vector<int64_t> {4}));
+}
+
+TEST(RecyclerTest, grouped_rowset_delete_executor_uses_rowset_meta_estimated_object_budget) {
+    GroupedRowsetDeleteExecutorConfigGuard guard;
+    config::recycle_rowsets_per_tablet_batch_size = 10;
+    config::recycle_rowsets_estimated_delete_object_budget = 3;
+
+    SimpleThreadPool worker_pool(1);
+    ASSERT_EQ(worker_pool.start(), 0);
+    DORIS_CLOUD_DEFER {
+        ASSERT_EQ(worker_pool.stop(), 0);
+    };
+
+    std::vector<std::vector<int64_t>> executed_rowsets;
+    GroupedRowsetDeleteExecutor executor(&worker_pool, [&](std::vector<RowsetDeleteItem> items) {
+        std::vector<int64_t> rowsets;
+        for (const auto& item : items) {
+            rowsets.push_back(std::stoll(item.rowset_id));
+        }
+        executed_rowsets.push_back(std::move(rowsets));
+        return 0;
+    });
+
+    executor.add(make_rowset_delete_item(10001, 1, true, 4, 0));
+    executor.add(make_rowset_delete_item(10001, 2, true, 1, 1));
+    executor.add(make_rowset_delete_item(10001, 3, false));
+    executor.finish();
+
+    ASSERT_EQ(executed_rowsets.size(), 2);
+    EXPECT_EQ(executed_rowsets[0], (std::vector<int64_t> {1}));
+    EXPECT_EQ(executed_rowsets[1], (std::vector<int64_t> {2, 3}));
+}
+
+TEST(RecyclerTest, grouped_rowset_delete_executor_retries_failed_group_until_success) {
+    GroupedRowsetDeleteExecutorConfigGuard guard;
+    config::recycle_rowsets_per_tablet_batch_size = 10;
+    config::recycle_rowsets_estimated_delete_object_budget = 100;
+    config::recycle_rowset_group_max_retry_times = 5;
+    config::recycle_rowset_group_retry_delay_seconds = 0;
+
+    SimpleThreadPool worker_pool(1);
+    ASSERT_EQ(worker_pool.start(), 0);
+    DORIS_CLOUD_DEFER {
+        ASSERT_EQ(worker_pool.stop(), 0);
+    };
+
+    std::atomic<int> attempts = 0;
+    std::vector<int64_t> consumed_rowsets;
+    GroupedRowsetDeleteExecutor executor(&worker_pool, [&](std::vector<RowsetDeleteItem> items) {
+        const int attempt = ++attempts;
+        if (attempt <= 2) {
+            return -1;
+        }
+        for (const auto& item : items) {
+            consumed_rowsets.push_back(std::stoll(item.rowset_id));
+        }
+        return 0;
+    });
+
+    for (int i = 0; i < 3; ++i) {
+        executor.add(make_rowset_delete_item(10001, i));
+    }
+    executor.finish();
+
+    EXPECT_EQ(attempts.load(), 3);
+    EXPECT_EQ(consumed_rowsets, (std::vector<int64_t> {0, 1, 2}));
+}
+
+TEST(RecyclerTest, grouped_rowset_delete_executor_drops_last_failed_group_after_max_retries) {
+    GroupedRowsetDeleteExecutorConfigGuard guard;
+    config::recycle_rowsets_per_tablet_batch_size = 10;
+    config::recycle_rowsets_estimated_delete_object_budget = 100;
+    config::recycle_rowset_group_max_retry_times = 3;
+    config::recycle_rowset_group_retry_delay_seconds = 0;
+
+    SimpleThreadPool worker_pool(1);
+    ASSERT_EQ(worker_pool.start(), 0);
+    DORIS_CLOUD_DEFER {
+        ASSERT_EQ(worker_pool.stop(), 0);
+    };
+
+    std::atomic<int> attempts = 0;
+    GroupedRowsetDeleteExecutor executor(&worker_pool, [&](std::vector<RowsetDeleteItem> items) {
+        EXPECT_EQ(items.size(), 2);
+        ++attempts;
+        return -1;
+    });
+
+    executor.add(make_rowset_delete_item(10001, 1));
+    executor.add(make_rowset_delete_item(10001, 2));
+
+    auto finish_future = std::async(std::launch::async, [&] { executor.finish(); });
+    ASSERT_EQ(finish_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    finish_future.get();
+
+    EXPECT_EQ(attempts.load(), 3);
+}
+
+TEST(RecyclerTest, grouped_rowset_delete_executor_drops_group_when_execute_task_throws) {
+    GroupedRowsetDeleteExecutorConfigGuard guard;
+    config::recycle_rowsets_per_tablet_batch_size = 10;
+    config::recycle_rowsets_estimated_delete_object_budget = 100;
+    config::recycle_rowset_group_max_retry_times = 3;
+    config::recycle_rowset_group_retry_delay_seconds = 0;
+
+    SimpleThreadPool worker_pool(1);
+    ASSERT_EQ(worker_pool.start(), 0);
+    DORIS_CLOUD_DEFER {
+        ASSERT_EQ(worker_pool.stop(), 0);
+    };
+
+    std::atomic<int> attempts = 0;
+    GroupedRowsetDeleteExecutor executor(&worker_pool, [&](std::vector<RowsetDeleteItem> items) {
+        EXPECT_EQ(items.size(), 2);
+        ++attempts;
+        throw std::runtime_error("injected failure");
+        return 0;
+    });
+
+    executor.add(make_rowset_delete_item(10001, 1));
+    executor.add(make_rowset_delete_item(10001, 2));
+
+    auto finish_future = std::async(std::launch::async, [&] { executor.finish(); });
+    ASSERT_EQ(finish_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    finish_future.get();
+
+    EXPECT_EQ(attempts.load(), 1);
+}
 
 TEST(RecyclerTest, WhiteBlackList) {
     WhiteBlackList filter;
@@ -1668,14 +1997,11 @@ TEST(RecyclerTest, recycle_rowsets_delete_remaining_rowsets_by_tablet) {
     config::retention_seconds = 0;
     auto origin_worker_pool_size = config::instance_recycler_worker_pool_size;
     auto origin_per_tablet_batch_size = config::recycle_rowsets_per_tablet_batch_size;
-    auto origin_delete_batch_size = config::recycle_rowsets_delete_batch_size;
     config::instance_recycler_worker_pool_size = 4;
     config::recycle_rowsets_per_tablet_batch_size = 10;
-    config::recycle_rowsets_delete_batch_size = 10;
     DORIS_CLOUD_DEFER {
         config::instance_recycler_worker_pool_size = origin_worker_pool_size;
         config::recycle_rowsets_per_tablet_batch_size = origin_per_tablet_batch_size;
-        config::recycle_rowsets_delete_batch_size = origin_delete_batch_size;
     };
 
     auto txn_kv = std::make_shared<MemTxnKv>();
@@ -1735,14 +2061,11 @@ TEST(RecyclerTest, recycle_rowsets_delete_full_batches_and_leftover_kvs) {
     config::retention_seconds = 0;
     auto origin_worker_pool_size = config::instance_recycler_worker_pool_size;
     auto origin_per_tablet_batch_size = config::recycle_rowsets_per_tablet_batch_size;
-    auto origin_delete_batch_size = config::recycle_rowsets_delete_batch_size;
     config::instance_recycler_worker_pool_size = 1;
     config::recycle_rowsets_per_tablet_batch_size = 3;
-    config::recycle_rowsets_delete_batch_size = 7;
     DORIS_CLOUD_DEFER {
         config::instance_recycler_worker_pool_size = origin_worker_pool_size;
         config::recycle_rowsets_per_tablet_batch_size = origin_per_tablet_batch_size;
-        config::recycle_rowsets_delete_batch_size = origin_delete_batch_size;
     };
 
     auto txn_kv = std::make_shared<MemTxnKv>();
@@ -1797,14 +2120,11 @@ TEST(RecyclerTest, recycle_rowsets_delete_prefix_rowset_kvs_without_remaining_ro
     config::retention_seconds = 0;
     auto origin_worker_pool_size = config::instance_recycler_worker_pool_size;
     auto origin_per_tablet_batch_size = config::recycle_rowsets_per_tablet_batch_size;
-    auto origin_delete_batch_size = config::recycle_rowsets_delete_batch_size;
     config::instance_recycler_worker_pool_size = 1;
     config::recycle_rowsets_per_tablet_batch_size = 10;
-    config::recycle_rowsets_delete_batch_size = 10;
     DORIS_CLOUD_DEFER {
         config::instance_recycler_worker_pool_size = origin_worker_pool_size;
         config::recycle_rowsets_per_tablet_batch_size = origin_per_tablet_batch_size;
-        config::recycle_rowsets_delete_batch_size = origin_delete_batch_size;
     };
 
     auto txn_kv = std::make_shared<MemTxnKv>();
@@ -1852,14 +2172,11 @@ TEST(RecyclerTest, recycle_rowsets_delete_old_empty_resource_id_kvs_with_normal_
     config::retention_seconds = 0;
     auto origin_worker_pool_size = config::instance_recycler_worker_pool_size;
     auto origin_per_tablet_batch_size = config::recycle_rowsets_per_tablet_batch_size;
-    auto origin_delete_batch_size = config::recycle_rowsets_delete_batch_size;
     config::instance_recycler_worker_pool_size = 4;
     config::recycle_rowsets_per_tablet_batch_size = 10;
-    config::recycle_rowsets_delete_batch_size = 10;
     DORIS_CLOUD_DEFER {
         config::instance_recycler_worker_pool_size = origin_worker_pool_size;
         config::recycle_rowsets_per_tablet_batch_size = origin_per_tablet_batch_size;
-        config::recycle_rowsets_delete_batch_size = origin_delete_batch_size;
     };
 
     auto txn_kv = std::make_shared<MemTxnKv>();
