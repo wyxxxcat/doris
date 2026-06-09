@@ -4354,6 +4354,10 @@ bool InstanceRecycler::decode_packed_file_key(std::string_view key, std::string*
 }
 
 int InstanceRecycler::recycle_packed_files() {
+    if (!config::enable_recycle_packed_files) {
+        LOG_INFO("recycle_packed_files is disabled, skip").tag("instance_id", instance_id_);
+        return 0;
+    }
     const std::string task_name = "recycle_packed_files";
     auto start_tp = steady_clock::now();
     int64_t start_time = duration_cast<seconds>(start_tp.time_since_epoch()).count();
@@ -4375,7 +4379,7 @@ int InstanceRecycler::recycle_packed_files() {
         g_bvar_recycler_packed_file_bytes_object_deleted.put(instance_id_,
                                                              stats.bytes_object_deleted);
         g_bvar_recycler_packed_file_rowset_scanned_num.put(instance_id_, stats.rowset_scan_count);
-        LOG_INFO("recycle packed files finished, cost={}s", cost)
+        LOG_WARNING("recycle packed files finished, cost={}s", cost)
                 .tag("instance_id", instance_id_)
                 .tag("num_scanned", stats.num_scanned)
                 .tag("num_corrected", stats.num_corrected)

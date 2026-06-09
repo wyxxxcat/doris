@@ -100,6 +100,8 @@ CONF_mInt64(recycle_interval_seconds, "3600");
 CONF_mInt64(retention_seconds, "259200"); // 72h, global retention time
 CONF_mInt64(packed_file_correction_delay_seconds,
             "259200"); // seconds to wait before correcting packed files
+// Whether to run the recycle_packed_files task. Set to false to disable it.
+CONF_mBool(enable_recycle_packed_files, "true");
 CONF_Int32(recycle_concurrency, "16");
 CONF_mInt32(recycle_job_lease_expired_ms, "60000");
 CONF_mInt64(compacted_rowset_retention_seconds, "10800");  // 3h
