@@ -207,6 +207,20 @@ static RowsetDeleteItem make_rowset_delete_item(int64_t tablet_id, int64_t rowse
     return item;
 }
 
+// Simple per-rowset object cost used by the executor budget tests: one object per
+// segment, plus one index file per segment when the rowset carries index data.
+static int64_t test_estimate_object_count(const RowsetDeleteItem& item) {
+    if (!item.rowset.has_rowset_meta()) {
+        return 1;
+    }
+    const auto& rs = item.rowset.rowset_meta();
+    int64_t num_segments = rs.num_segments();
+    if (num_segments <= 0) {
+        return 1;
+    }
+    return num_segments * (rs.index_disk_size() == 0 ? 1 : 2);
+}
+
 TEST(RecyclerTest, grouped_rowset_delete_executor_keeps_same_tablet_in_one_group) {
     GroupedRowsetDeleteExecutorConfigGuard guard;
     config::recycle_rowsets_per_tablet_batch_size = 2;
@@ -229,7 +243,7 @@ TEST(RecyclerTest, grouped_rowset_delete_executor_keeps_same_tablet_in_one_group
         std::lock_guard lock(mtx);
         executed_rowsets.push_back(std::move(rowsets));
         return 0;
-    });
+    }, test_estimate_object_count);
 
     for (int i = 0; i < config::recycle_rowsets_per_tablet_batch_size * 3 + 5; ++i) {
         executor.add(make_rowset_delete_item(10001, i));
@@ -261,7 +275,7 @@ TEST(RecyclerTest, grouped_rowset_delete_executor_splits_different_tablets_by_ca
         std::lock_guard lock(mtx);
         executed_tablets.push_back(std::move(tablets));
         return 0;
-    });
+    }, test_estimate_object_count);
 
     int64_t rowset_id = 0;
     for (int64_t tablet_id : {10001, 10002}) {
@@ -296,7 +310,7 @@ TEST(RecyclerTest, grouped_rowset_delete_executor_flushes_last_tablet_on_finish)
         EXPECT_EQ(items.size(), 2);
         executed_count += items.size();
         return 0;
-    });
+    }, test_estimate_object_count);
 
     executor.add(make_rowset_delete_item(10001, 1));
     executor.add(make_rowset_delete_item(10001, 2));
@@ -320,7 +334,7 @@ TEST(RecyclerTest, grouped_rowset_delete_executor_allows_single_tablet_over_capa
     GroupedRowsetDeleteExecutor executor(&worker_pool, [&](std::vector<RowsetDeleteItem> items) {
         executed_sizes.push_back(items.size());
         return 0;
-    });
+    }, test_estimate_object_count);
 
     for (int i = 0; i < 10; ++i) {
         executor.add(make_rowset_delete_item(10001, i));
@@ -352,7 +366,7 @@ TEST(RecyclerTest, grouped_rowset_delete_executor_consumes_prefix_by_budget_and_
         std::lock_guard lock(mtx);
         executed_rowsets.push_back(std::move(rowsets));
         return 0;
-    });
+    }, test_estimate_object_count);
 
     for (int i = 0; i < 5; ++i) {
         executor.add(make_rowset_delete_item(10001, i));
@@ -384,11 +398,58 @@ TEST(RecyclerTest, grouped_rowset_delete_executor_uses_rowset_meta_estimated_obj
         }
         executed_rowsets.push_back(std::move(rowsets));
         return 0;
-    });
+    }, test_estimate_object_count);
 
     executor.add(make_rowset_delete_item(10001, 1, true, 4, 0));
     executor.add(make_rowset_delete_item(10001, 2, true, 1, 1));
     executor.add(make_rowset_delete_item(10001, 3, false));
+    executor.finish();
+
+    ASSERT_EQ(executed_rowsets.size(), 2);
+    EXPECT_EQ(executed_rowsets[0], (std::vector<int64_t> {1}));
+    EXPECT_EQ(executed_rowsets[1], (std::vector<int64_t> {2, 3}));
+}
+
+TEST(RecyclerTest, grouped_rowset_delete_executor_uses_custom_object_count_estimator) {
+    GroupedRowsetDeleteExecutorConfigGuard guard;
+    config::recycle_rowsets_per_tablet_batch_size = 10;
+    config::recycle_rowsets_estimated_delete_object_budget = 8;
+
+    SimpleThreadPool worker_pool(1);
+    ASSERT_EQ(worker_pool.start(), 0);
+    DORIS_CLOUD_DEFER {
+        ASSERT_EQ(worker_pool.stop(), 0);
+    };
+
+    std::vector<std::vector<int64_t>> executed_rowsets;
+    // Simulate inverted index v1, where each segment produces one segment file
+    // plus one index file per index. Here we treat `index_disk_size` as the
+    // number of v1 inverted indexes so a rowset costs num_segments * (1 + #index).
+    auto estimate_object_count = [](const RowsetDeleteItem& item) -> int64_t {
+        if (!item.rowset.has_rowset_meta()) {
+            return 1;
+        }
+        const auto& rs = item.rowset.rowset_meta();
+        int64_t segs = std::max<int64_t>(1, rs.num_segments());
+        return segs * (1 + rs.index_disk_size());
+    };
+    GroupedRowsetDeleteExecutor executor(
+            &worker_pool,
+            [&](std::vector<RowsetDeleteItem> items) {
+                std::vector<int64_t> rowsets;
+                for (const auto& item : items) {
+                    rowsets.push_back(std::stoll(item.rowset_id));
+                }
+                executed_rowsets.push_back(std::move(rowsets));
+                return 0;
+            },
+            estimate_object_count);
+
+    // rowset 1: 2 segments * (1 + 3 indexes) = 8 objects -> fills the budget alone.
+    executor.add(make_rowset_delete_item(10001, 1, true, 2, 3));
+    // rowset 2 and 3: 1 object each.
+    executor.add(make_rowset_delete_item(10001, 2, true, 1, 0));
+    executor.add(make_rowset_delete_item(10001, 3, true, 1, 0));
     executor.finish();
 
     ASSERT_EQ(executed_rowsets.size(), 2);
@@ -420,7 +481,7 @@ TEST(RecyclerTest, grouped_rowset_delete_executor_retries_failed_group_until_suc
             consumed_rowsets.push_back(std::stoll(item.rowset_id));
         }
         return 0;
-    });
+    }, test_estimate_object_count);
 
     for (int i = 0; i < 3; ++i) {
         executor.add(make_rowset_delete_item(10001, i));
@@ -449,7 +510,7 @@ TEST(RecyclerTest, grouped_rowset_delete_executor_drops_last_failed_group_after_
         EXPECT_EQ(items.size(), 2);
         ++attempts;
         return -1;
-    });
+    }, test_estimate_object_count);
 
     executor.add(make_rowset_delete_item(10001, 1));
     executor.add(make_rowset_delete_item(10001, 2));
@@ -480,7 +541,7 @@ TEST(RecyclerTest, grouped_rowset_delete_executor_drops_group_when_execute_task_
         ++attempts;
         throw std::runtime_error("injected failure");
         return 0;
-    });
+    }, test_estimate_object_count);
 
     executor.add(make_rowset_delete_item(10001, 1));
     executor.add(make_rowset_delete_item(10001, 2));

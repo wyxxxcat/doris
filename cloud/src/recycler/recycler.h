@@ -464,6 +464,13 @@ private:
     // return 0 for success otherwise error
     int delete_rowset_data(const doris::RowsetMetaCloudPB& rs_meta_pb);
 
+    // Estimate the number of s3 objects that deleting this rowset will produce
+    // (segment files plus inverted index files). Used to budget how many rowsets
+    // a single delete batch consumes, so that we avoid hitting s3 per-prefix rate
+    // limits. Resolves inverted index count/format the same way as
+    // delete_rowset_data (inline tablet schema first, then schema kv cache).
+    int64_t estimate_rowset_delete_object_count(const doris::RowsetMetaCloudPB& rs_meta);
+
     // return 0 for success otherwise error
     // NOTE: this function ONLY be called when the file paths cannot be calculated
     int delete_rowset_data(const std::string& resource_id, int64_t tablet_id,

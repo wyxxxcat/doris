@@ -144,9 +144,18 @@ struct RowsetDeleteItem {
 
 class GroupedRowsetDeleteExecutor {
 public:
-    GroupedRowsetDeleteExecutor(SimpleThreadPool* worker_pool,
-                                std::function<int(std::vector<RowsetDeleteItem>)> execute_task)
-            : worker_pool_(worker_pool), execute_task_(std::move(execute_task)) {}
+    // `estimate_object_count` returns the estimated number of s3 objects deleting
+    // one rowset will produce; the executor uses it to keep each dispatched batch
+    // within recycle_rowsets_estimated_delete_object_budget.
+    GroupedRowsetDeleteExecutor(
+            SimpleThreadPool* worker_pool,
+            std::function<int(std::vector<RowsetDeleteItem>)> execute_task,
+            std::function<int64_t(const RowsetDeleteItem&)> estimate_object_count)
+            : worker_pool_(worker_pool),
+              execute_task_(std::move(execute_task)),
+              estimate_object_count_(std::move(estimate_object_count)) {
+        DCHECK(estimate_object_count_) << "estimate_object_count must be set";
+    }
 
     void add(RowsetDeleteItem item) {
         if (current_tablet_items_.empty()) {
@@ -189,16 +198,19 @@ public:
                     cv_.notify_all();
                 };
                 std::vector<RowsetDeleteItem> items;
+                // The budget is an estimate of how many s3 objects this batch will
+                // delete. Each rowset may produce many objects (one per segment, plus
+                // one inverted index file per index per segment for index v1), so we
+                // accumulate the per-rowset object cost and stop once the budget is
+                // reached. This keeps a single batch's object count close to the
+                // budget and reduces the chance of hitting s3 per-prefix rate limits.
                 int64_t consume_count = std::max<int64_t>(
                         1, config::recycle_rowsets_estimated_delete_object_budget);
+                // Always consume at least one rowset, even if it alone exceeds the
+                // budget, to guarantee forward progress.
                 while (consume_count > 0 && !task_group.items.empty()) {
-                    int64_t item_cost = 1;
-                    if (task_group.items.front().rowset.has_rowset_meta()) {
-                        auto rs = task_group.items.front().rowset.rowset_meta();
-                        item_cost = rs.index_disk_size() == 0 ? rs.num_segments()
-                                                              : rs.num_segments() * 2;
-                        item_cost = std::max<int64_t>(1, item_cost);
-                    }
+                    int64_t item_cost =
+                            std::max<int64_t>(1, estimate_object_count_(task_group.items.front()));
                     consume_count -= item_cost;
                     items.push_back(std::move(task_group.items.front()));
                     task_group.items.pop_front();
@@ -315,6 +327,8 @@ private:
 
     SimpleThreadPool* worker_pool_;
     std::function<int(std::vector<RowsetDeleteItem>)> execute_task_;
+    // Estimates the number of s3 objects a single rowset delete will produce.
+    std::function<int64_t(const RowsetDeleteItem&)> estimate_object_count_;
 };
 
 } // namespace
@@ -3303,6 +3317,55 @@ int InstanceRecycler::recycle_tablets(int64_t table_id, int64_t index_id,
     return ret;
 }
 
+int64_t InstanceRecycler::estimate_rowset_delete_object_count(
+        const doris::RowsetMetaCloudPB& rs_meta) {
+    int64_t num_segments = rs_meta.num_segments();
+    if (num_segments <= 0) {
+        return 1;
+    }
+
+    // Resolve the inverted index count and storage format exactly like
+    // delete_rowset_data does, so that the estimate matches the real number of
+    // s3 objects produced. Prefer the inline tablet schema; otherwise look up the
+    // schema kv cache by <index_id, schema_version>.
+    int64_t num_inverted_index = 0;
+    auto index_format = InvertedIndexStorageFormatPB::V1;
+    bool index_resolved = false;
+    if (rs_meta.has_tablet_schema()) {
+        for (const auto& index : rs_meta.tablet_schema().index()) {
+            if (index.has_index_type() && index.index_type() == IndexType::INVERTED) {
+                ++num_inverted_index;
+            }
+        }
+        if (rs_meta.tablet_schema().has_inverted_index_storage_format()) {
+            index_format = rs_meta.tablet_schema().inverted_index_storage_format();
+        }
+        index_resolved = true;
+    } else if (rs_meta.has_index_id() && rs_meta.has_schema_version()) {
+        InvertedIndexInfo index_info;
+        if (inverted_index_id_cache_->get(rs_meta.index_id(), rs_meta.schema_version(),
+                                          index_info) == 0) {
+            index_format = index_info.first;
+            num_inverted_index = static_cast<int64_t>(index_info.second.size());
+            index_resolved = true;
+        }
+    }
+
+    int64_t objects_per_segment = 1; // the segment data file
+    if (index_resolved) {
+        if (num_inverted_index > 0) {
+            // Inverted index v1 writes one file per index per segment, while v2
+            // writes a single combined index file per segment.
+            objects_per_segment +=
+                    index_format == InvertedIndexStorageFormatPB::V1 ? num_inverted_index : 1;
+        }
+    } else if (rs_meta.index_disk_size() > 0) {
+        // Schema is unavailable; fall back to assuming one index file per segment.
+        objects_per_segment += 1;
+    }
+    return num_segments * objects_per_segment;
+}
+
 int InstanceRecycler::delete_rowset_data(const RowsetMetaCloudPB& rs_meta_pb) {
     TEST_SYNC_POINT_RETURN_WITH_VALUE("delete_rowset_data::bypass_check", true);
     int64_t num_segments = rs_meta_pb.num_segments();
@@ -5381,7 +5444,14 @@ int InstanceRecycler::recycle_rowsets() {
         return ret;
     };
 
-    GroupedRowsetDeleteExecutor executor(worker_pool.get(), execute_delete_task);
+    auto estimate_delete_object_count = [this](const RowsetDeleteItem& item) -> int64_t {
+        if (!item.rowset.has_rowset_meta()) {
+            return 1;
+        }
+        return estimate_rowset_delete_object_count(item.rowset.rowset_meta());
+    };
+    GroupedRowsetDeleteExecutor executor(worker_pool.get(), execute_delete_task,
+                                         estimate_delete_object_count);
 
     int64_t earlest_ts = std::numeric_limits<int64_t>::max();
 
@@ -5453,7 +5523,7 @@ int InstanceRecycler::recycle_rowsets() {
         if (config::enable_mark_delete_rowset_before_recycle) {
             if (need_mark_rowset_as_recycled(rowset)) {
                 LOG(INFO) << "rowset queued to mark as recycled, recycler will delete data and kv "
-                              "at next turn, instance_id="
+                             "at next turn, instance_id="
                           << instance_id_ << " tablet_id=" << rowset_meta->tablet_id()
                           << " version=[" << rowset_meta->start_version() << '-'
                           << rowset_meta->end_version() << "]";
