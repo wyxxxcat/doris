@@ -4369,7 +4369,12 @@ int InstanceRecycler::delete_rowset_data(
         }
         ret = -1;
     }
-    ret = finished ? ret : -1;
+    // The SyncExecutor cancels on any non-zero result (including THROTTLED), which
+    // sets finished=false. Treat a premature stop as a hard failure only when the
+    // result was not classified as throttling, so the throttle signal is preserved.
+    if (!finished && ret != ObjectStorageResponse::THROTTLED) {
+        ret = -1;
+    }
     return ret;
 }
 
