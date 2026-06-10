@@ -21,7 +21,10 @@
 #include <aws/core/auth/AWSCredentials.h>
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
 #include <aws/core/auth/STSCredentialsProvider.h>
+#include <aws/core/client/AWSError.h>
+#include <aws/core/client/CoreErrors.h>
 #include <aws/core/client/DefaultRetryStrategy.h>
+#include <aws/core/http/HttpResponse.h>
 #include <aws/core/platform/Environment.h>
 #include <aws/identity-management/auth/STSAssumeRoleCredentialsProvider.h>
 #include <aws/s3/S3Client.h>
@@ -77,6 +80,28 @@ bvar::Adder<int64_t> get_rate_limit_ns("get_rate_limit_ns");
 bvar::Adder<int64_t> get_rate_limit_exceed_req_num("get_rate_limit_exceed_req_num");
 bvar::Adder<int64_t> put_rate_limit_ns("put_rate_limit_ns");
 bvar::Adder<int64_t> put_rate_limit_exceed_req_num("put_rate_limit_exceed_req_num");
+
+namespace {
+// Retry strategy for the recycler's S3 client. It behaves like S3CustomRetryStrategy
+// (same retry decisions, metrics and logging) except it does NOT retry throttling
+// errors (503 SlowDown / 429 / 509) at the SDK layer: those are surfaced immediately
+// so the recycler's group-level retry can back off with jitter per group instead of
+// the SDK hammering the same hot prefix with un-jittered, closely-spaced retries.
+class RecyclerS3RetryStrategy final : public doris::S3CustomRetryStrategy {
+public:
+    explicit RecyclerS3RetryStrategy(int max_retries) : doris::S3CustomRetryStrategy(max_retries) {}
+
+    bool ShouldRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors>& error,
+                     long attempted_retries) const override {
+        // Throttling is surfaced immediately for the group-level retry; everything
+        // else keeps S3CustomRetryStrategy's behavior (retry decision, metrics, logs).
+        if (is_s3_throttle_error(error)) {
+            return false;
+        }
+        return doris::S3CustomRetryStrategy::ShouldRetry(error, attempted_retries);
+    }
+};
+} // namespace
 
 AccessorRateLimiter::AccessorRateLimiter()
         : _rate_limiters(
@@ -441,8 +466,10 @@ int S3Accessor::init() {
         if (config::s3_client_http_scheme == "http") {
             aws_config.scheme = Aws::Http::Scheme::HTTP;
         }
-        aws_config.retryStrategy = std::make_shared<S3CustomRetryStrategy>(
-                config::max_s3_client_retry, config::s3_client_retry_slow_down);
+        // Throttling (503 SlowDown / 429 / 509) is intentionally not retried at the
+        // SDK layer here; it bubbles up to the recycler's group-level jittered retry.
+        aws_config.retryStrategy =
+                std::make_shared<RecyclerS3RetryStrategy>(config::max_s3_client_retry);
 
         if (_ca_cert_file_path.empty()) {
             _ca_cert_file_path =

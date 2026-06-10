@@ -44,24 +44,6 @@ namespace doris::cloud {
     return {Aws::S3::S3Errors::INTERNAL_FAILURE, "exceeds limit", "exceeds limit", false};
 }
 
-// Returns true if the S3 error indicates the request was throttled (rate limited)
-// by the backend, e.g. 503 SlowDown / 429 TooManyRequests. The caller can then
-// back off and retry rather than treating the failure as permanent.
-static bool is_s3_throttle_error(const Aws::S3::S3Error& error) {
-    switch (error.GetResponseCode()) {
-    case Aws::Http::HttpResponseCode::SERVICE_UNAVAILABLE: // 503, e.g. SlowDown
-    case Aws::Http::HttpResponseCode::TOO_MANY_REQUESTS:   // 429
-    case Aws::Http::HttpResponseCode::BANDWIDTH_LIMIT_EXCEEDED: // 509
-        return true;
-    default:
-        break;
-    }
-    const auto& name = error.GetExceptionName();
-    return name == "SlowDown" || name == "RequestThrottled" ||
-           name == "RequestThrottledException" || name == "ThrottlingException" ||
-           name == "Throttling" || name == "TooManyRequests" || name == "RequestLimitExceeded";
-}
-
 template <typename Func>
 auto s3_rate_limit(S3RateLimitType op, Func callback) -> decltype(callback()) {
     using T = decltype(callback());

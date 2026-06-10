@@ -25,7 +25,8 @@
 #endif
 
 namespace doris {
-class S3CustomRetryStrategy final : public Aws::Client::DefaultRetryStrategy {
+// Not `final`: the cloud recycler derives a variant that skips retrying throttling.
+class S3CustomRetryStrategy : public Aws::Client::DefaultRetryStrategy {
 public:
     S3CustomRetryStrategy(int maxRetries, bool retry_slow_down = true);
     ~S3CustomRetryStrategy() override;

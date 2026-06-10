@@ -18,6 +18,7 @@
 #pragma once
 
 #include <aws/core/Aws.h>
+#include <aws/core/http/HttpResponse.h>
 #include <bvar/latency_recorder.h>
 
 #include <array>
@@ -40,6 +41,28 @@ enum class S3RateLimitType;
 namespace cloud {
 class ObjectStoreInfoPB;
 class SimpleThreadPool;
+
+// Returns true if the AWS error indicates the request was throttled (rate limited)
+// by the backend, e.g. 503 SlowDown / 429 TooManyRequests / 509. Templated so it
+// works for both Aws::S3::S3Error and Aws::Client::AWSError<CoreErrors>; both expose
+// GetResponseCode() and GetExceptionName(). This is the single source of truth used
+// by the S3 retry strategy (whether to retry at the SDK layer) and by the delete
+// paths (whether to surface ObjectStorageResponse::THROTTLED).
+template <typename AwsErrorType>
+inline bool is_s3_throttle_error(const AwsErrorType& error) {
+    switch (error.GetResponseCode()) {
+    case Aws::Http::HttpResponseCode::SERVICE_UNAVAILABLE:      // 503, e.g. SlowDown
+    case Aws::Http::HttpResponseCode::TOO_MANY_REQUESTS:        // 429
+    case Aws::Http::HttpResponseCode::BANDWIDTH_LIMIT_EXCEEDED: // 509
+        return true;
+    default:
+        break;
+    }
+    const auto& name = error.GetExceptionName();
+    return name == "SlowDown" || name == "RequestThrottled" ||
+           name == "RequestThrottledException" || name == "ThrottlingException" ||
+           name == "Throttling" || name == "TooManyRequests" || name == "RequestLimitExceeded";
+}
 
 namespace s3_bvar {
 extern bvar::LatencyRecorder s3_get_latency;
