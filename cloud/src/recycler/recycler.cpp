@@ -250,6 +250,9 @@ public:
 
 private:
     struct Group {
+        // Stable unique id assigned when the group is flushed to the queue, so the
+        // same logical group can be tracked across retries in logs.
+        uint64_t id = 0;
         std::deque<RowsetDeleteItem> items;
         steady_clock::time_point ready_time = steady_clock::time_point::min();
         int retry_times = 0;
@@ -260,6 +263,15 @@ private:
                                              : item.rowset.tablet_id();
     }
 
+    // Returns a random value in [0, upper], used to add jitter to the retry backoff.
+    static int64_t next_jitter_ms(int64_t upper) {
+        if (upper <= 0) {
+            return 0;
+        }
+        static thread_local std::mt19937_64 rng {std::random_device {}()};
+        return std::uniform_int_distribution<int64_t>(0, upper)(rng);
+    }
+
     void flush_building_group_to_queue() {
         if (building_group_.items.empty()) {
             return;
@@ -267,6 +279,7 @@ private:
 
         Group group = std::move(building_group_);
         building_group_ = Group {};
+        group.id = ++next_group_id_;
 
         {
             std::unique_lock lock(mtx_);
@@ -297,19 +310,54 @@ private:
                                 int ret) {
         std::lock_guard lock(mtx_);
         if (ret != 0) {
+            // Only backend throttling (e.g. S3 503 SlowDown) is retried with backoff.
+            // The S3 client already retries other transient errors internally, so any
+            // non-throttle failure is treated as permanent: drop the failed batch
+            // (pop_items) but still process the rest of the group below.
+            const bool throttled = (ret == ObjectStorageResponse::THROTTLED);
             const int max_retry_times = std::max(1, config::recycle_rowset_group_max_retry_times);
-            if (++task_group.retry_times >= max_retry_times) {
-                LOG_WARNING("skip failed rowset delete group after reaching max retries")
-                        .tag("retry_times", task_group.retry_times)
-                        .tag("max_retry_times", max_retry_times)
-                        .tag("rowset_count", task_group.items.size() + pop_items.size());
-                return;
-            } else {
-                const int64_t retry_delay_seconds =
-                        std::max<int64_t>(0, config::recycle_rowset_group_retry_delay_seconds);
-                task_group.ready_time = steady_clock::now() + seconds(retry_delay_seconds);
-                task_group.items.insert(task_group.items.end(), pop_items.begin(), pop_items.end());
+            const RowsetDeleteItem* first_item = !pop_items.empty() ? &pop_items.front()
+                                                 : !task_group.items.empty()
+                                                         ? &task_group.items.front()
+                                                         : nullptr;
+            LOG_WARNING("rowset delete group task failed")
+                    .tag("group_id", task_group.id)
+                    .tag("ret", ret)
+                    .tag("throttled", throttled)
+                    .tag("retry_times", task_group.retry_times)
+                    .tag("max_retry_times", max_retry_times)
+                    .tag("first_tablet_id", first_item ? tablet_id(*first_item) : -1)
+                    .tag("first_rowset_id", first_item ? first_item->rowset_id : std::string())
+                    .tag("remaining_rowset_count", task_group.items.size())
+                    .tag("popped_rowset_count", pop_items.size())
+                    .tag("rowset_count", task_group.items.size() + pop_items.size());
+            if (throttled && ++task_group.retry_times < max_retry_times) {
+                // Clamp to a sane ceiling so the backoff and the ms jitter
+                // computation below cannot overflow int64 for absurd configs.
+                const int64_t max_delay = std::clamp<int64_t>(
+                        config::recycle_rowset_group_retry_max_delay_seconds, 1, 3600);
+                // Exponential backoff: 1s, 2s, 4s, ... capped at max_delay. Stop
+                // doubling before exceeding max_delay so the *2 never overflows.
+                int64_t backoff_seconds = 1;
+                for (int i = 1; i < task_group.retry_times && backoff_seconds <= max_delay / 2; ++i) {
+                    backoff_seconds *= 2;
+                }
+                // Equal jitter to avoid groups retrying in lockstep and re-triggering
+                // the same throttle: delay in [backoff/2, backoff], at ms precision.
+                const int64_t half_ms = backoff_seconds * 500;
+                const int64_t delay_ms = half_ms + next_jitter_ms(half_ms);
+                task_group.ready_time = steady_clock::now() + milliseconds(delay_ms);
+                // Move the throttled batch back into the group to retry it.
+                task_group.items.insert(task_group.items.end(),
+                                        std::make_move_iterator(pop_items.begin()),
+                                        std::make_move_iterator(pop_items.end()));
             }
+            // Non-throttle failure or retries exhausted: pop_items are dropped here.
+        } else {
+            // Succeeded: the group made progress, so reset the backoff state.
+            // Any remaining items are retried immediately without accumulated delay.
+            task_group.retry_times = 0;
+            task_group.ready_time = steady_clock::time_point::min();
         }
         if (!task_group.items.empty()) {
             groups_.push_back(std::move(task_group));
@@ -324,6 +372,8 @@ private:
 
     Group building_group_;
     std::deque<RowsetDeleteItem> current_tablet_items_;
+    // Monotonic counter for assigning Group::id. Only touched by the producer thread.
+    uint64_t next_group_id_ = 0;
 
     SimpleThreadPool* worker_pool_;
     std::function<int(std::vector<RowsetDeleteItem>)> execute_task_;
@@ -4308,10 +4358,16 @@ int InstanceRecycler::delete_rowset_data(
     bool finished = true;
     std::vector<int> rets = concurrent_delete_executor.when_all(&finished);
     for (int r : rets) {
-        if (r != 0) {
-            ret = -1;
+        if (r == 0) {
+            continue;
+        }
+        // Surface throttling (retryable) over a generic error: if any sub-delete
+        // was throttled, report THROTTLED so the caller can back off and retry.
+        if (r == ObjectStorageResponse::THROTTLED) {
+            ret = ObjectStorageResponse::THROTTLED;
             break;
         }
+        ret = -1;
     }
     ret = finished ? ret : -1;
     return ret;
@@ -5373,7 +5429,15 @@ int InstanceRecycler::recycle_rowsets() {
                                         : item.rowset.tablet_id();
             int delete_ret = delete_rowset_data(resource_id, tablet_id, item.rowset_id);
             if (delete_ret != 0) {
-                ret = -1;
+                // Throttling takes precedence: if any item in this batch was
+                // throttled, report THROTTLED so the whole group is retried with
+                // backoff (a permanent failure mixed in is retried until it hits
+                // max_retry_times, then dropped). A batch with no throttling at all
+                // reports -1 and is dropped immediately.
+                ret = (delete_ret == ObjectStorageResponse::THROTTLED ||
+                       ret == ObjectStorageResponse::THROTTLED)
+                              ? ObjectStorageResponse::THROTTLED
+                              : -1;
                 num_object_delete_failed++;
                 LOG(WARNING) << "failed to delete rowset data with prefix type, tablet_id="
                              << tablet_id << ", rowset_id=" << item.rowset_id
@@ -5416,7 +5480,12 @@ int InstanceRecycler::recycle_rowsets() {
             int delete_ret = delete_rowset_data(
                     rowsets_to_delete, RowsetRecyclingState::FORMAL_ROWSET, metrics_context);
             if (delete_ret != 0) {
-                ret = -1;
+                // Throttling takes precedence over a permanent failure so the group
+                // is retried with backoff; see the prefix-delete path above.
+                ret = (delete_ret == ObjectStorageResponse::THROTTLED ||
+                       ret == ObjectStorageResponse::THROTTLED)
+                              ? ObjectStorageResponse::THROTTLED
+                              : -1;
                 num_object_delete_failed += rowsets_to_delete.size();
                 LOG(WARNING) << "failed to delete rowset data with object type, rowsets.size()="
                              << rowsets_to_delete.size()

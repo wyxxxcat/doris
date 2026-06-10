@@ -17,6 +17,7 @@
 
 #include "recycler/s3_obj_client.h"
 
+#include <aws/core/http/HttpResponse.h>
 #include <aws/s3/S3Client.h>
 #include <aws/s3/model/AbortMultipartUploadRequest.h>
 #include <aws/s3/model/DeleteObjectRequest.h>
@@ -41,6 +42,24 @@ namespace doris::cloud {
 
 [[maybe_unused]] static Aws::Client::AWSError<Aws::S3::S3Errors> s3_error_factory() {
     return {Aws::S3::S3Errors::INTERNAL_FAILURE, "exceeds limit", "exceeds limit", false};
+}
+
+// Returns true if the S3 error indicates the request was throttled (rate limited)
+// by the backend, e.g. 503 SlowDown / 429 TooManyRequests. The caller can then
+// back off and retry rather than treating the failure as permanent.
+static bool is_s3_throttle_error(const Aws::S3::S3Error& error) {
+    switch (error.GetResponseCode()) {
+    case Aws::Http::HttpResponseCode::SERVICE_UNAVAILABLE: // 503, e.g. SlowDown
+    case Aws::Http::HttpResponseCode::TOO_MANY_REQUESTS:   // 429
+    case Aws::Http::HttpResponseCode::BANDWIDTH_LIMIT_EXCEEDED: // 509
+        return true;
+    default:
+        break;
+    }
+    const auto& name = error.GetExceptionName();
+    return name == "SlowDown" || name == "RequestThrottled" ||
+           name == "RequestThrottledException" || name == "ThrottlingException" ||
+           name == "Throttling" || name == "TooManyRequests" || name == "RequestLimitExceeded";
 }
 
 template <typename Func>
@@ -284,7 +303,9 @@ ObjectStorageResponse S3ObjClient::delete_objects(const std::string& bucket,
                          static_cast<int>(delete_outcome.GetError().GetResponseCode()))
                     .tag("error", delete_outcome.GetError().GetMessage())
                     .tag("request_id", delete_outcome.GetError().GetRequestId());
-            return -1;
+            return is_s3_throttle_error(delete_outcome.GetError())
+                           ? static_cast<int>(ObjectStorageResponse::THROTTLED)
+                           : -1;
         }
 
         return 0;
@@ -336,6 +357,9 @@ ObjectStorageResponse S3ObjClient::delete_object(ObjectStoragePathRef path) {
                 .tag("request_id", outcome.GetError().GetRequestId());
         if (outcome.GetError().GetResponseCode() == Aws::Http::HttpResponseCode::NOT_FOUND) {
             return {ObjectStorageResponse::NOT_FOUND, outcome.GetError().GetMessage()};
+        }
+        if (is_s3_throttle_error(outcome.GetError())) {
+            return {ObjectStorageResponse::THROTTLED, outcome.GetError().GetMessage()};
         }
         return {ObjectStorageResponse::UNDEFINED, outcome.GetError().GetMessage()};
     }

@@ -36,6 +36,9 @@ ObjectStorageResponse ObjStorageClient::delete_objects_recursively_(ObjectStorag
     ObjectStorageResponse ret;
     size_t num_deleted = 0;
     int error_count = 0;
+    // Tracks whether any batch failed due to backend throttling so the aggregated
+    // result can surface THROTTLED (retryable) instead of a generic error.
+    bool throttled = false;
     size_t batch_count = 0;
     auto start_time = steady_clock::now();
 
@@ -110,6 +113,9 @@ ObjectStorageResponse ObjStorageClient::delete_objects_recursively_(ObjectStorag
         for (int r : rets) {
             if (r != 0) {
                 error_count++;
+                if (r == ObjectStorageResponse::THROTTLED) {
+                    throttled = true;
+                }
             }
         }
 
@@ -139,7 +145,7 @@ ObjectStorageResponse ObjStorageClient::delete_objects_recursively_(ObjectStorag
 
     if (error_count > 0) {
         LOG(WARNING) << "delete_objects_recursively completed with " << error_count << " errors";
-        ret = {-1};
+        ret = {throttled ? static_cast<int>(ObjectStorageResponse::THROTTLED) : -1};
     }
 
     auto elapsed = duration_cast<milliseconds>(steady_clock::now() - start_time).count();

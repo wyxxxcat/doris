@@ -173,20 +173,20 @@ public:
             : per_tablet_batch_size_(config::recycle_rowsets_per_tablet_batch_size),
               delete_object_budget_(config::recycle_rowsets_estimated_delete_object_budget),
               max_retry_times_(config::recycle_rowset_group_max_retry_times),
-              retry_delay_seconds_(config::recycle_rowset_group_retry_delay_seconds) {}
+              retry_max_delay_seconds_(config::recycle_rowset_group_retry_max_delay_seconds) {}
 
     ~GroupedRowsetDeleteExecutorConfigGuard() {
         config::recycle_rowsets_per_tablet_batch_size = per_tablet_batch_size_;
         config::recycle_rowsets_estimated_delete_object_budget = delete_object_budget_;
         config::recycle_rowset_group_max_retry_times = max_retry_times_;
-        config::recycle_rowset_group_retry_delay_seconds = retry_delay_seconds_;
+        config::recycle_rowset_group_retry_max_delay_seconds = retry_max_delay_seconds_;
     }
 
 private:
     int32_t per_tablet_batch_size_;
     int32_t delete_object_budget_;
     int32_t max_retry_times_;
-    int32_t retry_delay_seconds_;
+    int64_t retry_max_delay_seconds_;
 };
 
 static RowsetDeleteItem make_rowset_delete_item(int64_t tablet_id, int64_t rowset_id,
@@ -462,7 +462,7 @@ TEST(RecyclerTest, grouped_rowset_delete_executor_retries_failed_group_until_suc
     config::recycle_rowsets_per_tablet_batch_size = 10;
     config::recycle_rowsets_estimated_delete_object_budget = 100;
     config::recycle_rowset_group_max_retry_times = 5;
-    config::recycle_rowset_group_retry_delay_seconds = 0;
+    config::recycle_rowset_group_retry_max_delay_seconds = 1;
 
     SimpleThreadPool worker_pool(1);
     ASSERT_EQ(worker_pool.start(), 0);
@@ -475,7 +475,8 @@ TEST(RecyclerTest, grouped_rowset_delete_executor_retries_failed_group_until_suc
     GroupedRowsetDeleteExecutor executor(&worker_pool, [&](std::vector<RowsetDeleteItem> items) {
         const int attempt = ++attempts;
         if (attempt <= 2) {
-            return -1;
+            // Only throttling is retried with backoff.
+            return static_cast<int>(ObjectStorageResponse::THROTTLED);
         }
         for (const auto& item : items) {
             consumed_rowsets.push_back(std::stoll(item.rowset_id));
@@ -497,7 +498,7 @@ TEST(RecyclerTest, grouped_rowset_delete_executor_drops_last_failed_group_after_
     config::recycle_rowsets_per_tablet_batch_size = 10;
     config::recycle_rowsets_estimated_delete_object_budget = 100;
     config::recycle_rowset_group_max_retry_times = 3;
-    config::recycle_rowset_group_retry_delay_seconds = 0;
+    config::recycle_rowset_group_retry_max_delay_seconds = 1;
 
     SimpleThreadPool worker_pool(1);
     ASSERT_EQ(worker_pool.start(), 0);
@@ -509,7 +510,8 @@ TEST(RecyclerTest, grouped_rowset_delete_executor_drops_last_failed_group_after_
     GroupedRowsetDeleteExecutor executor(&worker_pool, [&](std::vector<RowsetDeleteItem> items) {
         EXPECT_EQ(items.size(), 2);
         ++attempts;
-        return -1;
+        // Throttling is retried up to max_retry_times before the group is dropped.
+        return static_cast<int>(ObjectStorageResponse::THROTTLED);
     }, test_estimate_object_count);
 
     executor.add(make_rowset_delete_item(10001, 1));
@@ -522,12 +524,43 @@ TEST(RecyclerTest, grouped_rowset_delete_executor_drops_last_failed_group_after_
     EXPECT_EQ(attempts.load(), 3);
 }
 
+TEST(RecyclerTest, grouped_rowset_delete_executor_drops_non_throttle_failure_immediately) {
+    GroupedRowsetDeleteExecutorConfigGuard guard;
+    config::recycle_rowsets_per_tablet_batch_size = 10;
+    config::recycle_rowsets_estimated_delete_object_budget = 100;
+    config::recycle_rowset_group_max_retry_times = 5;
+    config::recycle_rowset_group_retry_max_delay_seconds = 1;
+
+    SimpleThreadPool worker_pool(1);
+    ASSERT_EQ(worker_pool.start(), 0);
+    DORIS_CLOUD_DEFER {
+        ASSERT_EQ(worker_pool.stop(), 0);
+    };
+
+    std::atomic<int> attempts = 0;
+    GroupedRowsetDeleteExecutor executor(&worker_pool, [&](std::vector<RowsetDeleteItem> items) {
+        EXPECT_EQ(items.size(), 2);
+        ++attempts;
+        // A non-throttle failure is permanent: the group is dropped without retry.
+        return -1;
+    }, test_estimate_object_count);
+
+    executor.add(make_rowset_delete_item(10001, 1));
+    executor.add(make_rowset_delete_item(10001, 2));
+
+    auto finish_future = std::async(std::launch::async, [&] { executor.finish(); });
+    ASSERT_EQ(finish_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    finish_future.get();
+
+    EXPECT_EQ(attempts.load(), 1);
+}
+
 TEST(RecyclerTest, grouped_rowset_delete_executor_drops_group_when_execute_task_throws) {
     GroupedRowsetDeleteExecutorConfigGuard guard;
     config::recycle_rowsets_per_tablet_batch_size = 10;
     config::recycle_rowsets_estimated_delete_object_budget = 100;
     config::recycle_rowset_group_max_retry_times = 3;
-    config::recycle_rowset_group_retry_delay_seconds = 0;
+    config::recycle_rowset_group_retry_max_delay_seconds = 1;
 
     SimpleThreadPool worker_pool(1);
     ASSERT_EQ(worker_pool.start(), 0);

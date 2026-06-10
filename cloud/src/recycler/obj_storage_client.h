@@ -34,6 +34,9 @@ struct ObjectStorageResponse {
         UNDEFINED = -1,
         OK = 0,
         NOT_FOUND = 1,
+        // The storage backend throttled the request (e.g. S3 503 SlowDown / 429).
+        // Callers may back off and retry instead of treating it as permanent.
+        THROTTLED = 2,
     };
 
     ObjectStorageResponse(int r = OK, std::string msg = "") : ret(r), error_msg(std::move(msg)) {}
