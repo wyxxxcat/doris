@@ -153,6 +153,8 @@ CONF_mInt64(packed_file_txn_retry_sleep_max_ms, "50");
 CONF_mInt32(recycle_txn_delete_max_retry_times, "10");
 CONF_mInt32(recycle_rowset_group_max_retry_times, "10");
 CONF_mInt64(recycle_rowset_group_retry_delay_seconds, "1");
+// Max number of rowsets a single grouped rowset delete task can hold.
+CONF_mInt32(recycle_rowset_group_max_rowsets, "5000");
 
 // force recycler to recycle all useless object.
 // **just for TEST**

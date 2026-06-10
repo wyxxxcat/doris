@@ -284,7 +284,7 @@ private:
 
         if (!building_group_.items.empty() &&
             building_group_.items.size() + current_tablet_items_.size() >
-                    config::recycle_rowsets_per_tablet_batch_size * 3) {
+                    static_cast<size_t>(std::max(1, config::recycle_rowset_group_max_rowsets))) {
             flush_building_group_to_queue();
         }
         building_group_.items.insert(building_group_.items.end(),
