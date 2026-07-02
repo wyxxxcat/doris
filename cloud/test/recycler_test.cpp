@@ -1699,7 +1699,7 @@ static void check_delete_bitmap_keys_size(TxnKv* txn_kv, int64_t tablet_id, int 
     if (version == 2) {
         dbm_start_key = versioned::meta_delete_bitmap_key({instance_id, tablet_id, ""});
         dbm_end_key = versioned::meta_delete_bitmap_key({instance_id, tablet_id + 1, ""});
-    } else if (version == 1) {
+    } else if (version == 1) {delete_rowset_data_packed_file_multiple_groups
         dbm_start_key = meta_delete_bitmap_key({instance_id, tablet_id, "", 0, 0});
         dbm_end_key = meta_delete_bitmap_key({instance_id, tablet_id + 1, "", 0, 0});
     }

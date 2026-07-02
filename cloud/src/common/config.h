@@ -116,7 +116,6 @@ CONF_mInt32(instance_recycler_worker_pool_size, "32");
 // Max number of delete tasks per batch when recycling objects.
 // Each task deletes up to 1000 files. Controls memory usage during large-scale deletion.
 CONF_Int32(recycler_max_tasks_per_batch, "1000");
-// Deprecated compatibility aliases for existing deployments/tests.
 // Max expired recycle_rowset entries to process for one tablet in one recycle_rowsets scan.
 // Remaining entries are left for later scans so deletion can spread across tablet prefixes.
 CONF_mInt32(recycle_rowsets_per_tablet_batch_size, "1000");

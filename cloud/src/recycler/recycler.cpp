@@ -5281,6 +5281,10 @@ int InstanceRecycler::recycle_rowsets() {
     std::string next_scan_begin;
     const size_t rowset_batch_size_per_tablet =
             std::max(1, config::recycle_rowsets_per_tablet_batch_size);
+    auto worker_pool = std::make_unique<SimpleThreadPool>(
+            config::instance_recycler_worker_pool_size, "recycle_rowsets");
+    worker_pool->start();
+
     auto try_reserve_tablet_recycle_slot = [&](int64_t tablet_id) -> bool {
         if (current_tablet_id != tablet_id) {
             current_tablet_id = tablet_id;
@@ -5311,9 +5315,20 @@ int InstanceRecycler::recycle_rowsets() {
         next_scan_begin.clear();
         return true;
     };
-    auto worker_pool = std::make_unique<SimpleThreadPool>(
-            config::instance_recycler_worker_pool_size, "recycle_rowsets");
-    worker_pool->start();
+
+
+    auto delete_versioned_delete_bitmap_kvs = [&](int64_t tablet_id, const std::string& rowset_id) {
+        std::string dbm_start_key =
+                versioned::meta_delete_bitmap_key({instance_id_, tablet_id, rowset_id});
+        std::string dbm_end_key = dbm_start_key;
+        encode_int64(INT64_MAX, &dbm_end_key);
+        auto ret = txn_remove(txn_kv_.get(), dbm_start_key, dbm_end_key);
+        if (ret != 0) {
+            LOG(WARNING) << "failed to delete versioned delete bitmap kv, instance_id="
+                         << instance_id_;
+        }
+        return ret;
+    };
 
     // Execute one grouped rowset delete task.
     // KV_ONLY items only remove recycle keys;
@@ -5449,6 +5464,8 @@ int InstanceRecycler::recycle_rowsets() {
                              << ", ret=" << delete_ret;
             } else {
                 if (item.rowset.has_rowset_meta()) {
+                    delete_versioned_delete_bitmap_kvs(tablet_id,
+                                                       item.rowset.rowset_meta().rowset_id_v2());
                     const auto& rowset_meta = item.rowset.rowset_meta();
                     metrics_context.total_recycled_data_size += rowset_meta.total_disk_size();
                     metrics_context.total_recycled_num++;
