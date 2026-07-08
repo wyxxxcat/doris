@@ -679,8 +679,9 @@ class UpCommand(Command):
 
             instance_id = getattr(args, 'instance_id', None)
             cluster_snapshot = getattr(args, 'cluster_snapshot', '')
+            env = getattr(args, 'env', None)
             enable_storage_vault = CLUSTER.is_true(
-                CLUSTER.get_env_value(args.env, "ENABLE_STORAGE_VAULT"))
+                CLUSTER.get_env_value(env, "ENABLE_STORAGE_VAULT"))
 
             cluster = CLUSTER.Cluster.new(
                 args.NAME, args.IMAGE, args.cloud, args.root, args.fe_config,
