@@ -105,7 +105,47 @@ private:
 
     void check_recycle_tasks();
 
+    void enqueue_instance_for_recycle(InstanceInfoPB instance);
+
+    std::shared_ptr<InstanceRecycler> get_active_instance_recycler(const std::string& instance_id);
+
+    bool has_running_task(const std::string& instance_id) const;
+
+    void stop_active_instance_recycler(const std::string& instance_id);
+
 private:
+    struct RecycleTaskItem {
+        RecycleTaskItem() = default;
+        RecycleTaskItem(std::string instance_id, std::string unit_id)
+                : instance_id(std::move(instance_id)), unit_id(std::move(unit_id)) {}
+
+        std::string instance_id;
+        std::string unit_id;
+
+        bool operator==(const RecycleTaskItem& rhs) const {
+            return instance_id == rhs.instance_id && unit_id == rhs.unit_id;
+        }
+    };
+
+    struct RecycleTaskItemHash {
+        size_t operator()(const RecycleTaskItem& item) const {
+            size_t seed = std::hash<std::string> {}(item.instance_id);
+            seed ^= std::hash<std::string> {}(item.unit_id) + 0x9e3779b9 + (seed << 6) +
+                    (seed >> 2);
+            return seed;
+        }
+    };
+
+    struct ActiveInstanceRecycler {
+        ActiveInstanceRecycler(std::shared_ptr<InstanceRecycler> recycler,
+                               std::string instance_info_value)
+                : recycler(std::move(recycler)),
+                  instance_info_value(std::move(instance_info_value)) {}
+
+        std::shared_ptr<InstanceRecycler> recycler;
+        std::string instance_info_value;
+    };
+
     friend class RecyclerServiceImpl;
 
     std::shared_ptr<TxnKv> txn_kv_;
@@ -116,9 +156,15 @@ private:
     std::mutex mtx_;
     // notify recycle workers
     std::condition_variable pending_instance_cond_;
+    std::condition_variable pending_task_cond_;
     std::deque<InstanceInfoPB> pending_instance_queue_;
     std::unordered_set<std::string> pending_instance_set_;
     std::unordered_map<std::string, std::shared_ptr<InstanceRecycler>> recycling_instance_map_;
+    std::deque<RecycleTaskItem> pending_task_queue_;
+    std::unordered_set<RecycleTaskItem, RecycleTaskItemHash> pending_task_set_;
+    std::unordered_set<RecycleTaskItem, RecycleTaskItemHash> running_task_set_;
+    std::unordered_map<std::string, ActiveInstanceRecycler> active_instance_recycler_map_;
+    std::unordered_set<std::string> cleaned_legacy_recycle_job_set_;
     // notify instance scanner and lease thread
     std::condition_variable notifier_;
 
@@ -283,6 +329,12 @@ public:
 
     // returns 0 for success otherwise error
     int do_recycle();
+
+    int do_recycle_task(std::string_view unit_id);
+
+    int recycle_indexes_partitions();
+
+    int recycle_txn();
 
     // remove all kv and data in this instance, ONLY be called when instance has been deleted
     // returns 0 for success otherwise error

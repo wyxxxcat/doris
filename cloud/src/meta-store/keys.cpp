@@ -65,6 +65,7 @@ static const char* RECYCLE_KEY_TXN                      = "txn";
 static const char* STATS_KEY_INFIX_TABLET               = "tablet";
 
 static const char* JOB_KEY_INFIX_TABLET                 = "tablet";
+static const char* JOB_KEY_INFIX_RECYCLE_TASK           = "recycle_task";
 static const char* JOB_KEY_INFIX_RL_PROGRESS            = "routine_load_progress";
 static const char* JOB_KEY_INFIX_STREAMING_JOB          = "streaming_job";
 static const char* JOB_KEY_INFIX_RESTORE_TABLET         = "restore_tablet";
@@ -149,7 +150,7 @@ static void encode_prefix(const T& t, std::string* key) {
         MetaDeleteBitmapInfo, MetaDeleteBitmapUpdateLockInfo, MetaPendingDeleteBitmapInfo, PartitionVersionKeyInfo,
         RecycleIndexKeyInfo, RecyclePartKeyInfo, RecycleRowsetKeyInfo, RecycleTxnKeyInfo, RecycleStageKeyInfo,
         StatsTabletKeyInfo, TableVersionKeyInfo, JobRestoreTabletKeyInfo, JobRestoreRowsetKeyInfo,
-        JobTabletKeyInfo, JobRecycleKeyInfo, JobSnapshotDataMigratorKeyInfo, JobSnapshotChainCompactorKeyInfo,
+        JobTabletKeyInfo, JobRecycleKeyInfo, JobRecycleTaskKeyInfo, JobSnapshotDataMigratorKeyInfo, JobSnapshotChainCompactorKeyInfo,
         RLJobProgressKeyInfo, StreamingJobKeyInfo,
         CopyJobKeyInfo, CopyFileKeyInfo,  StorageVaultKeyInfo, MetaSchemaPBDictionaryInfo,
         MowTabletJobInfo, PackedFileKeyInfo>);
@@ -187,8 +188,9 @@ static void encode_prefix(const T& t, std::string* key) {
     } else if constexpr (std::is_same_v<T, StatsTabletKeyInfo>) {
         encode_bytes(STATS_KEY_PREFIX, key);
     } else if constexpr (std::is_same_v<T, JobTabletKeyInfo>
-                      || std::is_same_v<T, JobRecycleKeyInfo>
-                      || std::is_same_v<T, JobSnapshotDataMigratorKeyInfo>
+                       || std::is_same_v<T, JobRecycleKeyInfo>
+                       || std::is_same_v<T, JobRecycleTaskKeyInfo>
+                       || std::is_same_v<T, JobSnapshotDataMigratorKeyInfo>
                       || std::is_same_v<T, JobSnapshotChainCompactorKeyInfo>
                       || std::is_same_v<T, RLJobProgressKeyInfo>
                       || std::is_same_v<T, StreamingJobKeyInfo>) {
@@ -465,6 +467,12 @@ void job_tablet_key(const JobTabletKeyInfo& in, std::string* out) {
 void job_recycle_key(const JobRecycleKeyInfo& in, std::string* out) {
     encode_prefix(in, out);       // 0x01 "job" ${instance_id}
     encode_bytes("recycle", out); // "recycle"
+}
+
+void job_recycle_task_key(const JobRecycleTaskKeyInfo& in, std::string* out) {
+    encode_prefix(in, out);                        // 0x01 "job" ${instance_id}
+    encode_bytes(JOB_KEY_INFIX_RECYCLE_TASK, out); // "recycle_task"
+    encode_bytes(std::get<1>(in), out);            // unit_id
 }
 
 void job_check_key(const JobRecycleKeyInfo& in, std::string* out) {

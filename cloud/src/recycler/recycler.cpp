@@ -33,7 +33,6 @@
 #include <cstdlib>
 #include <deque>
 #include <functional>
-#include <initializer_list>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -85,6 +84,20 @@ using namespace std::chrono;
 
 namespace {
 
+#define NORMAL_RECYCLE_TASKS(M)                         \
+    M("cluster_snapshots", recycle_cluster_snapshots)   \
+    M("operation_logs", recycle_operation_logs)         \
+    M("indexes_partitions", recycle_indexes_partitions) \
+    M("tmp_rowsets", recycle_tmp_rowsets)               \
+    M("rowsets", recycle_rowsets)                       \
+    M("packed_files", recycle_packed_files)             \
+    M("txn", recycle_txn)                               \
+    M("copy_jobs", recycle_copy_jobs)                   \
+    M("stage", recycle_stage)                           \
+    M("stage_objects", recycle_expired_stage_objects)   \
+    M("versions", recycle_versions)                     \
+    M("restore_jobs", recycle_restore_jobs)
+
 int64_t packed_file_retry_sleep_ms() {
     const int64_t min_ms = std::max<int64_t>(0, config::packed_file_txn_retry_sleep_min_ms);
     const int64_t max_ms = std::max<int64_t>(min_ms, config::packed_file_txn_retry_sleep_max_ms);
@@ -119,6 +132,15 @@ bool filter_out_instance(const std::string& instance_id) {
     }
     return std::ranges::find(config::recycle_whitelist, instance_id) ==
            config::recycle_whitelist.end();
+}
+
+const std::vector<std::string>& normal_recycle_unit_ids() {
+    static const std::vector<std::string> unit_ids = {
+#define NORMAL_RECYCLE_UNIT_ID(unit_id, func) unit_id,
+            NORMAL_RECYCLE_TASKS(NORMAL_RECYCLE_UNIT_ID)
+#undef NORMAL_RECYCLE_UNIT_ID
+    };
+    return unit_ids;
 }
 
 } // namespace
@@ -283,17 +305,10 @@ void Recycler::instance_scanner_callback() {
                 return ss.str();
             }();
             if (!instances.empty()) {
-                // enqueue instances
-                std::lock_guard lock(mtx_);
                 for (auto& instance : instances) {
                     if (filter_out_instance(instance.instance_id())) continue;
-                    auto [_, success] = pending_instance_set_.insert(instance.instance_id());
-                    // skip instance already in pending queue
-                    if (success) {
-                        pending_instance_queue_.push_back(std::move(instance));
-                    }
+                    enqueue_instance_for_recycle(std::move(instance));
                 }
-                pending_instance_cond_.notify_all();
             }
         } else {
             LOG(WARNING) << "Skip recycler since enable_recycler is false";
@@ -306,20 +321,222 @@ void Recycler::instance_scanner_callback() {
     }
 }
 
+void Recycler::enqueue_instance_for_recycle(InstanceInfoPB instance) {
+    const auto& instance_id = instance.instance_id();
+    if (instance.status() == InstanceInfoPB::NORMAL) {
+        std::shared_ptr<InstanceRecycler> new_recycler;
+        std::string instance_info_value = instance.SerializeAsString();
+        bool need_create_recycler = false;
+        {
+            std::lock_guard lock(mtx_);
+            auto it = active_instance_recycler_map_.find(instance_id);
+            if (it == active_instance_recycler_map_.end() || it->second.recycler->stopped()) {
+                active_instance_recycler_map_.erase(instance_id);
+                need_create_recycler = true;
+            } else if (it->second.instance_info_value != instance_info_value) {
+                it->second.recycler->stop();
+                if (!has_running_task(instance_id)) {
+                    active_instance_recycler_map_.erase(it);
+                    need_create_recycler = true;
+                }
+            }
+        }
+        if (need_create_recycler) {
+            new_recycler = std::make_shared<InstanceRecycler>(txn_kv_, instance, _thread_pool_group,
+                                                              txn_lazy_committer_);
+            if (int r = new_recycler->init(); r != 0) {
+                LOG(WARNING) << "failed to init instance recycler, instance_id=" << instance_id
+                             << " ret=" << r;
+                return;
+            }
+        }
+        {
+            std::lock_guard lock(mtx_);
+            if (new_recycler) {
+                auto it = active_instance_recycler_map_.find(instance_id);
+                if (it == active_instance_recycler_map_.end()) {
+                    active_instance_recycler_map_.emplace(
+                            instance_id, ActiveInstanceRecycler(new_recycler, instance_info_value));
+                } else if (it->second.instance_info_value != instance_info_value ||
+                           it->second.recycler->stopped()) {
+                    return;
+                }
+            }
+            auto active_it = active_instance_recycler_map_.find(instance_id);
+            if (active_it == active_instance_recycler_map_.end() ||
+                active_it->second.recycler->stopped()) {
+                return;
+            }
+            for (const auto& unit_id : normal_recycle_unit_ids()) {
+                RecycleTaskItem task(instance_id, unit_id);
+                if (pending_task_set_.count(task) || running_task_set_.count(task)) {
+                    continue;
+                }
+                pending_task_set_.insert(task);
+                pending_task_queue_.push_back(std::move(task));
+            }
+            pending_task_cond_.notify_all();
+        }
+        bool need_clean_legacy_recycle_job = false;
+        {
+            std::lock_guard lock(mtx_);
+            need_clean_legacy_recycle_job =
+                    cleaned_legacy_recycle_job_set_.insert(instance_id).second;
+        }
+        if (need_clean_legacy_recycle_job) {
+            std::string recycle_job_key;
+            job_recycle_key({instance_id}, &recycle_job_key);
+            if (txn_remove(txn_kv_.get(), std::vector<std::string> {recycle_job_key}) != 0) {
+                LOG(WARNING) << "failed to remove legacy recycle job key for normal instance, "
+                                "instance_id="
+                             << instance_id;
+            }
+        }
+        return;
+    }
+    if (instance.status() == InstanceInfoPB::DELETED) {
+        std::lock_guard lock(mtx_);
+        auto [_, success] = pending_instance_set_.insert(instance_id);
+        if (success) {
+            pending_instance_queue_.push_back(std::move(instance));
+            pending_task_cond_.notify_all();
+        }
+        return;
+    }
+    LOG(WARNING) << "invalid instance status: " << instance.status()
+                 << " instance_id=" << instance_id;
+}
+
+std::shared_ptr<InstanceRecycler> Recycler::get_active_instance_recycler(
+        const std::string& instance_id) {
+    auto it = active_instance_recycler_map_.find(instance_id);
+    if (it == active_instance_recycler_map_.end()) {
+        return nullptr;
+    }
+    return it->second.recycler;
+}
+
+bool Recycler::has_running_task(const std::string& instance_id) const {
+    return std::ranges::any_of(running_task_set_, [&instance_id](const RecycleTaskItem& task) {
+        return task.instance_id == instance_id;
+    });
+}
+
+void Recycler::stop_active_instance_recycler(const std::string& instance_id) {
+    auto recycler = get_active_instance_recycler(instance_id);
+    if (recycler) {
+        recycler->stop();
+    }
+}
+
 void Recycler::recycle_callback() {
     while (!stopped()) {
+        RecycleTaskItem task;
+        bool has_task = false;
         InstanceInfoPB instance;
+        bool has_instance = false;
         {
             std::unique_lock lock(mtx_);
-            pending_instance_cond_.wait(
-                    lock, [&]() { return !pending_instance_queue_.empty() || stopped(); });
+            pending_task_cond_.wait(lock, [&]() {
+                return !pending_task_queue_.empty() || !pending_instance_queue_.empty() ||
+                       stopped();
+            });
             if (stopped()) {
                 return;
             }
-            instance = std::move(pending_instance_queue_.front());
-            pending_instance_queue_.pop_front();
-            pending_instance_set_.erase(instance.instance_id());
+            if (!pending_task_queue_.empty()) {
+                task = std::move(pending_task_queue_.front());
+                pending_task_queue_.pop_front();
+                pending_task_set_.erase(task);
+                if (running_task_set_.count(task)) {
+                    continue;
+                }
+                running_task_set_.insert(task);
+                has_task = true;
+            } else {
+                instance = std::move(pending_instance_queue_.front());
+                pending_instance_queue_.pop_front();
+                pending_instance_set_.erase(instance.instance_id());
+                has_instance = true;
+            }
         }
+        if (has_task) {
+            const auto& instance_id = task.instance_id;
+            const auto& unit_id = task.unit_id;
+            DORIS_CLOUD_DEFER {
+                std::lock_guard lock(mtx_);
+                running_task_set_.erase(task);
+                if (!has_running_task(instance_id)) {
+                    auto it = active_instance_recycler_map_.find(instance_id);
+                    if (it != active_instance_recycler_map_.end() &&
+                        it->second.recycler->stopped()) {
+                        active_instance_recycler_map_.erase(it);
+                    }
+                }
+            };
+            if (!config::enable_recycler) {
+                LOG(WARNING) << "Skip recycle task, instance_id=" << instance_id
+                             << " unit_id=" << unit_id << " since enable_recycler is false";
+                continue;
+            }
+            std::shared_ptr<InstanceRecycler> instance_recycler;
+            {
+                std::lock_guard lock(mtx_);
+                instance_recycler = get_active_instance_recycler(instance_id);
+            }
+            if (!instance_recycler || instance_recycler->stopped()) {
+                LOG(WARNING) << "skip recycle task without active recycler, instance_id="
+                             << instance_id << " unit_id=" << unit_id;
+                continue;
+            }
+
+            std::string recycle_job_key;
+            job_recycle_task_key({instance_id, unit_id}, &recycle_job_key);
+            int ret = prepare_task_recycle_job(txn_kv_.get(), recycle_job_key, instance_id, unit_id,
+                                               ip_port_, config::recycle_interval_seconds * 1000);
+            if (ret != 0) {
+                LOG(WARNING) << "failed to prepare recycle task job, instance_id=" << instance_id
+                             << " unit_id=" << unit_id << " ret=" << ret;
+                continue;
+            }
+            if (stopped()) return;
+            LOG_WARNING("begin to recycle task")
+                    .tag("instance_id", instance_id)
+                    .tag("unit_id", unit_id);
+            auto ctime_ms =
+                    duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+            g_bvar_recycler_instance_recycle_start_ts.put({instance_id}, ctime_ms);
+            g_bvar_recycler_instance_recycle_task_status.put({"submitted"}, 1);
+            ret = instance_recycler->do_recycle_task(unit_id);
+
+            if (!instance_recycler->stopped()) {
+                finish_task_recycle_job(txn_kv_.get(), recycle_job_key, instance_id, unit_id,
+                                        ip_port_, ret == 0, ctime_ms);
+            }
+            if (instance_recycler->stopped() || ret != 0) {
+                g_bvar_recycler_instance_recycle_task_status.put({"error"}, 1);
+            }
+
+            auto now = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+            auto elpased_ms = now - ctime_ms;
+            g_bvar_recycler_instance_recycle_end_ts.put({instance_id}, now);
+            g_bvar_recycler_instance_last_round_recycle_duration.put({instance_id}, elpased_ms);
+            g_bvar_recycler_instance_next_ts.put({instance_id},
+                                                 now + config::recycle_interval_seconds * 1000);
+            g_bvar_recycler_instance_recycle_task_status.put({"completed"}, 1);
+            if (ret == 0) {
+                g_bvar_recycler_instance_recycle_last_success_ts.put({instance_id}, now);
+            }
+            LOG(INFO) << "recycle task done, instance_id=" << instance_id << " unit_id=" << unit_id
+                      << " ret=" << ret << " cost: " << elpased_ms << "ms";
+
+            LOG_WARNING("finish recycle task")
+                    .tag("instance_id", instance_id)
+                    .tag("unit_id", unit_id)
+                    .tag("cost_ms", elpased_ms);
+            continue;
+        }
+        DCHECK(has_instance);
         auto& instance_id = instance.instance_id();
         {
             std::lock_guard lock(mtx_);
@@ -392,12 +609,27 @@ void Recycler::recycle_callback() {
 
 void Recycler::lease_recycle_jobs() {
     while (!stopped()) {
+        std::vector<RecycleTaskItem> tasks;
         std::vector<std::string> instances;
-        instances.reserve(recycling_instance_map_.size());
         {
             std::lock_guard lock(mtx_);
+            tasks.reserve(running_task_set_.size());
+            instances.reserve(recycling_instance_map_.size());
+            for (auto& task : running_task_set_) {
+                tasks.push_back(task);
+            }
             for (auto& [id, _] : recycling_instance_map_) {
                 instances.push_back(id);
+            }
+        }
+        for (auto& task : tasks) {
+            std::string recycle_job_key;
+            job_recycle_task_key({task.instance_id, task.unit_id}, &recycle_job_key);
+            int ret = lease_task_recycle_job(txn_kv_.get(), recycle_job_key, task.instance_id,
+                                             task.unit_id, ip_port_);
+            if (ret == 1) {
+                std::lock_guard lock(mtx_);
+                stop_active_instance_recycler(task.instance_id);
             }
         }
         for (auto& i : instances) {
@@ -424,12 +656,20 @@ void Recycler::lease_recycle_jobs() {
 void Recycler::check_recycle_tasks() {
     while (!stopped()) {
         std::unordered_map<std::string, std::shared_ptr<InstanceRecycler>> recycling_instance_map;
+        std::vector<std::shared_ptr<InstanceRecycler>> active_instance_recyclers;
         {
             std::lock_guard lock(mtx_);
             recycling_instance_map = recycling_instance_map_;
+            active_instance_recyclers.reserve(active_instance_recycler_map_.size());
+            for (auto& [_, active] : active_instance_recycler_map_) {
+                active_instance_recyclers.push_back(active.recycler);
+            }
         }
         for (auto& entry : recycling_instance_map) {
             entry.second->check_recycle_tasks();
+        }
+        for (auto& recycler : active_instance_recyclers) {
+            recycler->check_recycle_tasks();
         }
 
         std::unique_lock lock(mtx_);
@@ -499,10 +739,14 @@ void Recycler::stop() {
     stopped_ = true;
     notifier_.notify_all();
     pending_instance_cond_.notify_all();
+    pending_task_cond_.notify_all();
     {
         std::lock_guard lock(mtx_);
         for (auto& [_, recycler] : recycling_instance_map_) {
             recycler->stop();
+        }
+        for (auto& [_, active] : active_instance_recycler_map_) {
+            active.recycler->stop();
         }
     }
     for (auto& w : workers_) {
@@ -764,21 +1008,6 @@ int InstanceRecycler::init() {
     return init_storage_vault_accessors();
 }
 
-template <typename... Func>
-auto task_wrapper(Func... funcs) -> std::function<int()> {
-    return [funcs...]() {
-        return [](std::initializer_list<int> ret_vals) {
-            int i = 0;
-            for (int ret : ret_vals) {
-                if (ret != 0) {
-                    i = ret;
-                }
-            }
-            return i;
-        }({funcs()...});
-    };
-}
-
 int InstanceRecycler::do_recycle() {
     TEST_SYNC_POINT("InstanceRecycler.do_recycle");
     tablet_metrics_context_.reset();
@@ -794,46 +1023,45 @@ int InstanceRecycler::do_recycle() {
         }
         return recycle_deleted_instance();
     } else if (instance_info_.status() == InstanceInfoPB::NORMAL) {
-        SyncExecutor<int> sync_executor(_thread_pool_group.group_recycle_function_pool,
-                                        fmt::format("instance id {}", instance_id_),
-                                        [](int r) { return r != 0; });
-        sync_executor
-                .add(task_wrapper(
-                        [this]() { return InstanceRecycler::recycle_cluster_snapshots(); }))
-                .add(task_wrapper([this]() { return InstanceRecycler::recycle_operation_logs(); }))
-                .add(task_wrapper( // dropped table and dropped partition need to be recycled in series
-                                   // becase they may both recycle the same set of tablets
-                        // recycle dropped table or idexes(mv, rollup)
-                        [this]() -> int { return InstanceRecycler::recycle_indexes(); },
-                        // recycle dropped partitions
-                        [this]() -> int { return InstanceRecycler::recycle_partitions(); }))
-                .add(task_wrapper(
-                        [this]() -> int { return InstanceRecycler::recycle_tmp_rowsets(); }))
-                .add(task_wrapper([this]() -> int { return InstanceRecycler::recycle_rowsets(); }))
-                .add(task_wrapper(
-                        [this]() -> int { return InstanceRecycler::recycle_packed_files(); }))
-                .add(task_wrapper(
-                        [this]() { return InstanceRecycler::abort_timeout_txn(); },
-                        [this]() { return InstanceRecycler::recycle_expired_txn_label(); }))
-                .add(task_wrapper([this]() { return InstanceRecycler::recycle_copy_jobs(); }))
-                .add(task_wrapper([this]() { return InstanceRecycler::recycle_stage(); }))
-                .add(task_wrapper(
-                        [this]() { return InstanceRecycler::recycle_expired_stage_objects(); }))
-                .add(task_wrapper([this]() { return InstanceRecycler::recycle_versions(); }))
-                .add(task_wrapper([this]() { return InstanceRecycler::recycle_restore_jobs(); }));
-        bool finished = true;
-        std::vector<int> rets = sync_executor.when_all(&finished);
-        for (int ret : rets) {
+        for (const auto& unit_id : normal_recycle_unit_ids()) {
+            int ret = do_recycle_task(unit_id);
             if (ret != 0) {
                 return ret;
             }
         }
-        return finished ? 0 : -1;
+        return 0;
     } else {
         LOG(WARNING) << "invalid instance status: " << instance_info_.status()
                      << " instance_id=" << instance_id_;
         return -1;
     }
+}
+
+int InstanceRecycler::do_recycle_task(std::string_view unit_id) {
+#define DISPATCH_NORMAL_RECYCLE_TASK(id, func) \
+    if (unit_id == id) {                       \
+        return func();                         \
+    }
+    NORMAL_RECYCLE_TASKS(DISPATCH_NORMAL_RECYCLE_TASK)
+#undef DISPATCH_NORMAL_RECYCLE_TASK
+    LOG(WARNING) << "unknown recycle unit, instance_id=" << instance_id_ << " unit_id=" << unit_id;
+    return -1;
+}
+
+int InstanceRecycler::recycle_indexes_partitions() {
+    int ret = recycle_indexes();
+    if (ret != 0) {
+        return ret;
+    }
+    return recycle_partitions();
+}
+
+int InstanceRecycler::recycle_txn() {
+    int ret = abort_timeout_txn();
+    if (ret != 0) {
+        return ret;
+    }
+    return recycle_expired_txn_label();
 }
 
 /**

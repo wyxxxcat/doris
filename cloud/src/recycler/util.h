@@ -50,9 +50,17 @@ int prepare_instance_recycle_job(TxnKv* txn_kv, std::string_view key,
                                  const std::string& instance_id, const std::string& ip_port,
                                  int64_t interval_ms);
 
+int prepare_task_recycle_job(TxnKv* txn_kv, std::string_view key, const std::string& instance_id,
+                             const std::string& unit_id, const std::string& ip_port,
+                             int64_t interval_ms);
+
 void finish_instance_recycle_job(TxnKv* txn_kv, std::string_view key,
                                  const std::string& instance_id, const std::string& ip_port,
                                  bool success, int64_t ctime_ms);
+
+void finish_task_recycle_job(TxnKv* txn_kv, std::string_view key, const std::string& instance_id,
+                             const std::string& unit_id, const std::string& ip_port, bool success,
+                             int64_t ctime_ms);
 
 /**
  *
@@ -60,6 +68,9 @@ void finish_instance_recycle_job(TxnKv* txn_kv, std::string_view key,
  */
 int lease_instance_recycle_job(TxnKv* txn_kv, std::string_view key, const std::string& instance_id,
                                const std::string& ip_port);
+
+int lease_task_recycle_job(TxnKv* txn_kv, std::string_view key, const std::string& instance_id,
+                           const std::string& unit_id, const std::string& ip_port);
 
 inline std::string segment_path(int64_t tablet_id, const std::string& rowset_id,
                                 int64_t segment_id) {

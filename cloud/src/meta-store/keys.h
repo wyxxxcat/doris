@@ -66,6 +66,7 @@
 //
 // 0x01 "job" ${instance_id} "tablet" ${table_id} ${index_id} ${partition_id} ${tablet_id} -> TabletJobInfoPB
 // 0x01 "job" ${instance_id} "recycle"                                                     -> JobRecyclePB
+// 0x01 "job" ${instance_id} "recycle_task" ${unit_id}                                     -> JobRecyclePB
 // 0x01 "job" ${instance_id} "check"                                                       -> JobRecyclePB
 // 0x01 "job" ${instance_id} "snapshot_data_migrator"                                      -> JobRecyclePB
 // 0x01 "job" ${instance_id} "snapshot_chain_compactor"                                    -> JobRecyclePB
@@ -207,6 +208,9 @@ using RecycleStageKeyInfo  = BasicKeyInfo<__LINE__, std::tuple<std::string,  std
 
 //                                                      0:instance_id
 using JobRecycleKeyInfo    = BasicKeyInfo<__LINE__ , std::tuple<std::string>>;
+
+//                                                      0:instance_id  1:unit_id
+using JobRecycleTaskKeyInfo = BasicKeyInfo<__LINE__ , std::tuple<std::string,  std::string>>;
 
 //                                                      0:instance_id
 using JobSnapshotDataMigratorKeyInfo = BasicKeyInfo<53, std::tuple<std::string>>;
@@ -424,10 +428,12 @@ void job_restore_rowset_key(const JobRestoreRowsetKeyInfo& in, std::string* out)
 static inline std::string job_restore_rowset_key(const JobRestoreRowsetKeyInfo& in) { std::string s; job_restore_rowset_key(in, &s); return s; }
 
 void job_recycle_key(const JobRecycleKeyInfo& in, std::string* out);
+void job_recycle_task_key(const JobRecycleTaskKeyInfo& in, std::string* out);
 void job_check_key(const JobRecycleKeyInfo& in, std::string* out);
 void job_snapshot_data_migrator_key(const JobSnapshotDataMigratorKeyInfo& in, std::string* out);
 void job_snapshot_chain_compactor_key(const JobSnapshotChainCompactorKeyInfo& in, std::string* out);
 static inline std::string job_check_key(const JobRecycleKeyInfo& in) { std::string s; job_check_key(in, &s); return s; }
+static inline std::string job_recycle_task_key(const JobRecycleTaskKeyInfo& in) { std::string s; job_recycle_task_key(in, &s); return s; }
 static inline std::string job_snapshot_data_migrator_key(const JobSnapshotDataMigratorKeyInfo& in) { std::string s; job_snapshot_data_migrator_key(in, &s); return s; }
 static inline std::string job_snapshot_chain_compactor_key(const JobSnapshotChainCompactorKeyInfo& in) { std::string s; job_snapshot_chain_compactor_key(in, &s); return s; }
 void job_tablet_key(const JobTabletKeyInfo& in, std::string* out);

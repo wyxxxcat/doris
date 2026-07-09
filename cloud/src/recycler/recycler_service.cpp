@@ -346,16 +346,10 @@ void RecyclerServiceImpl::recycle_instance(::google::protobuf::RpcController* co
         instances.push_back(std::move(instance));
     }
     {
-        std::lock_guard lock(recycler_->mtx_);
         for (auto& i : instances) {
-            auto [_, success] = recycler_->pending_instance_set_.insert(i.instance_id());
-            // skip instance already in pending queue
-            if (success) {
-                // TODO(plat1ko): Support high priority
-                recycler_->pending_instance_queue_.push_back(std::move(i));
-            }
+            // TODO(plat1ko): Support high priority
+            recycler_->enqueue_instance_for_recycle(std::move(i));
         }
-        recycler_->pending_instance_cond_.notify_all();
     }
 }
 
