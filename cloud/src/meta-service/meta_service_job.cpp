@@ -911,7 +911,8 @@ void process_compaction_job(MetaServiceCode& code, std::string& msg, std::string
                             FinishTabletJobResponse* response, TabletJobInfoPB& recorded_job,
                             std::string& instance_id, std::string& job_key, bool& need_commit,
                             std::string& use_version, bool is_versioned_read,
-                            bool is_versioned_write, TxnKv* txn_kv, ResourceManager* resource_mgr) {
+                            bool is_versioned_write, TxnKv* txn_kv, ResourceManager* resource_mgr,
+                            bool skip_check_job_expiration) {
     //==========================================================================
     //                                check
     //==========================================================================
@@ -946,7 +947,8 @@ void process_compaction_job(MetaServiceCode& code, std::string& msg, std::string
 
     using namespace std::chrono;
     int64_t now = duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
-    if (recorded_compaction->expiration() > 0 && recorded_compaction->expiration() < now) {
+    if (!skip_check_job_expiration && recorded_compaction->expiration() > 0 &&
+        recorded_compaction->expiration() < now) {
         code = MetaServiceCode::JOB_EXPIRED;
         SS << "expired compaction job, tablet_id=" << tablet_id
            << " job=" << proto_to_json(*recorded_compaction);
@@ -1443,7 +1445,7 @@ void process_schema_change_job(MetaServiceCode& code, std::string& msg, std::str
                                std::string& instance_id, std::string& job_key, bool& need_commit,
                                std::string& use_version, bool is_versioned_read,
                                bool is_versioned_write, TxnKv* txn_kv,
-                               ResourceManager* resource_mgr) {
+                               ResourceManager* resource_mgr, bool skip_check_job_expiration) {
     //==========================================================================
     //                                check
     //==========================================================================
@@ -1544,7 +1546,8 @@ void process_schema_change_job(MetaServiceCode& code, std::string& msg, std::str
     auto& recorded_schema_change = recorded_job.schema_change();
     using namespace std::chrono;
     int64_t now = duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
-    if (recorded_schema_change.expiration() > 0 && recorded_schema_change.expiration() < now) {
+    if (!skip_check_job_expiration && recorded_schema_change.expiration() > 0 &&
+        recorded_schema_change.expiration() < now) {
         code = MetaServiceCode::JOB_EXPIRED;
         SS << "expired schema_change job, tablet_id=" << tablet_id
            << " job=" << proto_to_json(recorded_schema_change);
@@ -1992,7 +1995,8 @@ void _finish_tablet_job(const FinishTabletJobRequest* request, FinishTabletJobRe
                         std::string& instance_id, std::unique_ptr<Transaction>& txn, TxnKv* txn_kv,
                         DeleteBitmapLockWhiteList* delete_bitmap_lock_white_list,
                         ResourceManager* resource_mgr, MetaServiceCode& code, std::string& msg,
-                        std::stringstream& ss) {
+                        std::stringstream& ss, bool skip_check_job_expiration) {
+    DCHECK(!skip_check_job_expiration || request->action() == FinishTabletJobRequest::ABORT);
     bool is_versioned_read = resource_mgr->is_version_read_enabled(instance_id);
     bool is_versioned_write = resource_mgr->is_version_write_enabled(instance_id);
     for (int retry = 0; retry <= 1; retry++) {
@@ -2068,12 +2072,14 @@ void _finish_tablet_job(const FinishTabletJobRequest* request, FinishTabletJobRe
             // Process compaction commit
             process_compaction_job(code, msg, ss, txn, request, response, recorded_job, instance_id,
                                    job_key, need_commit, use_version, is_versioned_read,
-                                   is_versioned_write, txn_kv, resource_mgr);
+                                   is_versioned_write, txn_kv, resource_mgr,
+                                   skip_check_job_expiration);
         } else if (request->job().has_schema_change()) {
             // Process schema change commit
             process_schema_change_job(code, msg, ss, txn, request, response, recorded_job,
                                       instance_id, job_key, need_commit, use_version,
-                                      is_versioned_read, is_versioned_write, txn_kv, resource_mgr);
+                                      is_versioned_read, is_versioned_write, txn_kv, resource_mgr,
+                                      skip_check_job_expiration);
         }
 
         if (!need_commit) return;

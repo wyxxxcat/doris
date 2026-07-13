@@ -80,7 +80,8 @@ static void* run_bthread_work(void* arg) {
                                          std::unique_ptr<Transaction>& txn, TxnKv* txn_kv,
                                          DeleteBitmapLockWhiteList* delete_bitmap_lock_white_list,
                                          ResourceManager* resource_mgr, MetaServiceCode& code,
-                                         std::string& msg, std::stringstream& ss);
+                                         std::string& msg, std::stringstream& ss,
+                                         bool skip_check_job_expiration = false);
 
 class MetaServiceImpl : public cloud::MetaService {
 public:
