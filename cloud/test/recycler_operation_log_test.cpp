@@ -3127,15 +3127,9 @@ TEST(RecycleOperationLogTest, OplogRecycleStatsPerTypeCounters) {
     EXPECT_EQ(stats.recycled_commit_txn.load(), 1);
 }
 
-// Test recycle_operation_logs with stats enabled: drop partition + drop index logs
-// Verifies per-type recycled counts and bvar reporting
-TEST(RecycleOperationLogTest, RecycleOperationLogsWithStatsEnabled) {
-    auto old_flag = config::enable_recycler_stats_metrics;
-    config::enable_recycler_stats_metrics = true;
-    DORIS_CLOUD_DEFER {
-        config::enable_recycler_stats_metrics = old_flag;
-    };
-
+// Test recycle_operation_logs: drop partition + drop index logs.
+// Verifies per-type recycled counts and bvar reporting.
+TEST(RecycleOperationLogTest, RecycleOperationLogsWithStats) {
     auto txn_kv = std::make_shared<MemTxnKv>();
     txn_kv->update_commit_version(1000);
     ASSERT_EQ(txn_kv->init(), 0);
@@ -3276,12 +3270,6 @@ TEST(RecycleOperationLogTest, RecycleOperationLogsWithStatsEnabled) {
 
 // Test recycle_operation_logs with snapshot protection: some logs skipped
 TEST(RecycleOperationLogTest, RecycleOperationLogsSkippedBySnapshot) {
-    auto old_flag = config::enable_recycler_stats_metrics;
-    config::enable_recycler_stats_metrics = true;
-    DORIS_CLOUD_DEFER {
-        config::enable_recycler_stats_metrics = old_flag;
-    };
-
     auto txn_kv = std::make_shared<MemTxnKv>();
     txn_kv->update_commit_version(1000);
     ASSERT_EQ(txn_kv->init(), 0);
@@ -3384,14 +3372,7 @@ TEST(RecycleOperationLogTest, RecycleOperationLogsSkippedBySnapshot) {
     }
 }
 
-// Test recycle_operation_logs with stats disabled (default)
-TEST(RecycleOperationLogTest, RecycleOperationLogsStatsDisabled) {
-    auto old_flag = config::enable_recycler_stats_metrics;
-    config::enable_recycler_stats_metrics = false;
-    DORIS_CLOUD_DEFER {
-        config::enable_recycler_stats_metrics = old_flag;
-    };
-
+TEST(RecycleOperationLogTest, RecycleEmptyOperationLog) {
     auto txn_kv = std::make_shared<MemTxnKv>();
     txn_kv->update_commit_version(1000);
     ASSERT_EQ(txn_kv->init(), 0);
@@ -3400,13 +3381,13 @@ TEST(RecycleOperationLogTest, RecycleOperationLogsStatsDisabled) {
     instance.set_instance_id(instance_id);
     instance.set_multi_version_status(MultiVersionStatus::MULTI_VERSION_ENABLED);
     auto* obj_info = instance.add_obj_info();
-    obj_info->set_id("recycle_stats_disabled");
+    obj_info->set_id("recycle_empty_oplog");
     obj_info->set_ak(config::test_s3_ak);
     obj_info->set_sk(config::test_s3_sk);
     obj_info->set_endpoint(config::test_s3_endpoint);
     obj_info->set_region(config::test_s3_region);
     obj_info->set_bucket(config::test_s3_bucket);
-    obj_info->set_prefix("recycle_stats_disabled");
+    obj_info->set_prefix("recycle_empty_oplog");
     update_instance_info(txn_kv.get(), instance);
 
     InstanceRecycler recycler(txn_kv, instance, thread_group,
@@ -3426,7 +3407,7 @@ TEST(RecycleOperationLogTest, RecycleOperationLogsStatsDisabled) {
         ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
     }
 
-    // Recycle should succeed without stats collection
+    // Recycle should succeed for an empty operation log.
     ASSERT_EQ(recycler.recycle_operation_logs(), 0);
 
     // Verify all logs were recycled
@@ -3434,14 +3415,8 @@ TEST(RecycleOperationLogTest, RecycleOperationLogsStatsDisabled) {
     ASSERT_TRUE(is_empty_range(txn_kv.get())) << dump_range(txn_kv.get());
 }
 
-// Test recycle_operation_logs compaction log with stats: recycled_compaction tracking
+// Test recycle_operation_logs compaction log: recycled_compaction tracking.
 TEST(RecycleOperationLogTest, RecycleCompactionLogWithStats) {
-    auto old_flag = config::enable_recycler_stats_metrics;
-    config::enable_recycler_stats_metrics = true;
-    DORIS_CLOUD_DEFER {
-        config::enable_recycler_stats_metrics = old_flag;
-    };
-
     auto txn_kv = std::make_shared<MemTxnKv>();
     txn_kv->update_commit_version(1000);
     ASSERT_EQ(txn_kv->init(), 0);

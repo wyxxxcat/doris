@@ -1486,12 +1486,7 @@ int InstanceChecker::collect_unexpired_job_tmp_rowsets(
 
             // Must use the same threshold as the recycler so that a delete bitmap is never
             // reported as leaked while its tmp rowset is still alive from the recycler's view.
-            // `earlest_ts` is a local sentinel initialized to 0 on purpose: it keeps the value
-            // below any real expiration so the helper never updates the recycler's
-            // earliest-ts bvar (the checker must not touch the recycler's metrics).
-            int64_t earlest_ts = 0;
-            int64_t expiration =
-                    calculate_tmp_rowset_expired_time(instance_id_, rowset, &earlest_ts);
+            int64_t expiration = calculate_tmp_rowset_expired_time(rowset);
             if (current_time < expiration) {
                 tmp_rowsets[rowset.tablet_id()].insert(rowset.rowset_id_v2());
                 ++num_unexpired;

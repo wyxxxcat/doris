@@ -69,8 +69,6 @@ suite("test_recycler") {
         "recycle_partitions",
         "recycle_tmp_rowsets",
         "recycle_rowsets",
-        "recycle_tablet",
-        "recycle_segment",
         "recycle_copy_jobs",
         "recycle_stage",
         "recycle_expired_stage_objects",

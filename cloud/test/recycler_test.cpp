@@ -69,7 +69,7 @@ using namespace doris;
 std::string instance_id = "instance_id_recycle_test";
 int64_t current_time = 0;
 static constexpr int64_t db_id = 1000;
-static RecyclerMetricsContext ctx;
+static RecyclerMetricsContext ctx(instance_id, "recycle_test");
 
 namespace {
 
@@ -7617,8 +7617,7 @@ TEST(RecyclerTest, delete_rowset_data) {
 
             rowset_pbs.emplace(rowset.rowset_id_v2(), std::move(rowset));
         }
-        ASSERT_EQ(0, recycler.delete_rowset_data(rowset_pbs, RowsetRecyclingState::FORMAL_ROWSET,
-                                                 ctx));
+        ASSERT_EQ(0, recycler.delete_rowset_data(rowset_pbs, RowsetRecyclingState::FORMAL_ROWSET));
         std::unique_ptr<ListIterator> list_iter;
         ASSERT_EQ(0, accessor->list_all(&list_iter));
         ASSERT_FALSE(list_iter->has_next());
@@ -7855,9 +7854,7 @@ TEST(RecyclerTest, delete_rowset_data_packed_file_respects_recycled_tablet) {
 
     std::map<std::string, doris::RowsetMetaCloudPB> rowsets;
     rowsets.emplace(rowset.rowset_id_v2(), rowset);
-    RecyclerMetricsContext metrics_ctx(instance_id, "delete_rowset_data");
-    ASSERT_EQ(0, recycler.delete_rowset_data(rowsets, RowsetRecyclingState::FORMAL_ROWSET,
-                                             metrics_ctx));
+    ASSERT_EQ(0, recycler.delete_rowset_data(rowsets, RowsetRecyclingState::FORMAL_ROWSET));
 
     std::unique_ptr<Transaction> txn;
     ASSERT_EQ(TxnErrorCode::TXN_OK, txn_kv->create_txn(&txn));
@@ -7931,7 +7928,7 @@ TEST(RecyclerTest, delete_rowset_data_packed_file_batch_rowsets) {
 
     std::map<std::string, doris::RowsetMetaCloudPB> rowsets;
     rowsets.emplace(rowset.rowset_id_v2(), rowset);
-    ASSERT_EQ(0, recycler.delete_rowset_data(rowsets, RowsetRecyclingState::TMP_ROWSET, ctx));
+    ASSERT_EQ(0, recycler.delete_rowset_data(rowsets, RowsetRecyclingState::TMP_ROWSET));
 
     std::unique_ptr<Transaction> txn;
     ASSERT_EQ(TxnErrorCode::TXN_OK, txn_kv->create_txn(&txn));
@@ -8045,7 +8042,7 @@ TEST(RecyclerTest, delete_rowset_data_packed_file_multiple_groups) {
         ASSERT_EQ(TxnErrorCode::TXN_OK, txn->commit());
     }
 
-    ASSERT_EQ(0, recycler.delete_rowset_data(rowsets, RowsetRecyclingState::TMP_ROWSET, ctx));
+    ASSERT_EQ(0, recycler.delete_rowset_data(rowsets, RowsetRecyclingState::TMP_ROWSET));
 
     for (const auto& entry : expected_small_file_counts) {
         const auto& merged_path = entry.first;
@@ -8646,8 +8643,7 @@ TEST(RecyclerTest, delete_rowset_data_without_inverted_index_storage_format) {
 
             rowset_pbs.emplace(rowset.rowset_id_v2(), std::move(rowset));
         }
-        ASSERT_EQ(0, recycler.delete_rowset_data(rowset_pbs, RowsetRecyclingState::FORMAL_ROWSET,
-                                                 ctx));
+        ASSERT_EQ(0, recycler.delete_rowset_data(rowset_pbs, RowsetRecyclingState::FORMAL_ROWSET));
         std::unique_ptr<ListIterator> list_iter;
         ASSERT_EQ(0, accessor->list_all(&list_iter));
         ASSERT_FALSE(list_iter->has_next());
@@ -8923,7 +8919,7 @@ TEST(RecyclerTest, recycle_tablet_with_empty_resource_id_and_no_segments) {
                               std::make_shared<TxnLazyCommitter>(txn_kv));
     EXPECT_EQ(recycler.init(), 0);
 
-    RecyclerMetricsContext ctx;
+    RecyclerMetricsContext ctx(instance.instance_id(), "recycle_tablet");
     EXPECT_EQ(recycler.recycle_tablet(0, ctx), 0);
 }
 
@@ -8960,7 +8956,7 @@ TEST(RecyclerTest, recycle_tablet_with_resource_id_and_no_segments) {
     recycler.TEST_add_accessor("resource_id", accessor);
 
     EXPECT_EQ(accessor->exists("data/1234/orphan.dat"), 0);
-    RecyclerMetricsContext ctx;
+    RecyclerMetricsContext ctx(instance.instance_id(), "recycle_tablet");
     EXPECT_EQ(recycler.recycle_tablet(tablet_id, ctx), 0);
     EXPECT_EQ(accessor->exists("data/1234/orphan.dat"), 1);
 }
@@ -9294,7 +9290,7 @@ TEST(RecyclerTest, delete_tmp_rowset_data_with_idx_v1) {
         EXPECT_TRUE(list_files.contains("data/10000/1_0_1.idx"));
 
         ASSERT_EQ(0,
-                  recycler.delete_rowset_data(rowset_pbs, RowsetRecyclingState::TMP_ROWSET, ctx));
+                  recycler.delete_rowset_data(rowset_pbs, RowsetRecyclingState::TMP_ROWSET));
         list_files.clear();
         iter.reset();
         EXPECT_EQ(accessor->list_all(&iter), 0);
@@ -9374,7 +9370,7 @@ TEST(RecyclerTest, delete_tmp_rowset_data_with_idx_v2) {
         EXPECT_TRUE(list_files.contains("data/10000/1_0.idx"));
 
         ASSERT_EQ(0,
-                  recycler.delete_rowset_data(rowset_pbs, RowsetRecyclingState::TMP_ROWSET, ctx));
+                  recycler.delete_rowset_data(rowset_pbs, RowsetRecyclingState::TMP_ROWSET));
         list_files.clear();
         iter.reset();
         EXPECT_EQ(accessor->list_all(&iter), 0);
@@ -9440,7 +9436,7 @@ TEST(RecyclerTest, delete_tmp_rowset_data_with_rowset_idx_v3) {
         EXPECT_TRUE(list_files.contains("data/10000/1_0.idx"));
 
         ASSERT_EQ(0,
-                  recycler.delete_rowset_data(rowset_pbs, RowsetRecyclingState::TMP_ROWSET, ctx));
+                  recycler.delete_rowset_data(rowset_pbs, RowsetRecyclingState::TMP_ROWSET));
         list_files.clear();
         iter.reset();
         EXPECT_EQ(accessor->list_all(&iter), 0);
@@ -9538,7 +9534,7 @@ TEST(RecyclerTest, delete_tmp_rowset_without_resource_id) {
         EXPECT_TRUE(list_files.contains("data/20000/2_0.idx"));
 
         EXPECT_EQ(-1,
-                  recycler.delete_rowset_data(rowset_pbs, RowsetRecyclingState::TMP_ROWSET, ctx));
+                  recycler.delete_rowset_data(rowset_pbs, RowsetRecyclingState::TMP_ROWSET));
         list_files.clear();
         iter.reset();
         EXPECT_EQ(accessor->list_all(&iter), 0);

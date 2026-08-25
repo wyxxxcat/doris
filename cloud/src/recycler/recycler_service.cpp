@@ -115,17 +115,17 @@ void RecyclerServiceImpl::statistics_recycle(StatisticsRecycleRequest& req, Meta
                  instance_recycler.scan_and_statistics_expired_stage_objects();
              }}};
 
-    std::set<std::string> resource_types;
-    for (const auto& resource_type : req.resource_type()) {
-        if (resource_type == "*") {
+    std::set<std::string> task_types;
+    for (const auto& task_type : req.task_type()) {
+        if (task_type == "*") {
             std::ranges::for_each(resource_handlers,
-                                  [&](const auto& it) { resource_types.emplace(it.first); });
+                                  [&](const auto& it) { task_types.emplace(it.first); });
             break;
         } else {
-            if (!resource_handlers.contains(resource_type)) {
+            if (!resource_handlers.contains(task_type)) {
                 code = MetaServiceCode::INVALID_ARGUMENT;
                 msg = fmt::format(
-                        "invalid resource type: {}, valid resource_type have [{}]", resource_type,
+                        "invalid resource type: {}, valid task_type have [{}]", task_type,
                         std::accumulate(resource_handlers.begin(), resource_handlers.end(),
                                         std::string(), [](const std::string& acc, const auto& it) {
                                             return acc.empty() ? it.first : acc + ", " + it.first;
@@ -133,9 +133,13 @@ void RecyclerServiceImpl::statistics_recycle(StatisticsRecycleRequest& req, Meta
                 LOG_WARNING(msg);
                 return;
             } else {
-                resource_types.emplace(resource_type);
+                task_types.emplace(task_type);
             }
         }
+    }
+    if (task_types.empty()) {
+        std::ranges::for_each(resource_handlers,
+                              [&](const auto& it) { task_types.emplace(it.first); });
     }
 
     std::set<std::string> instance_ids;
@@ -198,19 +202,9 @@ void RecyclerServiceImpl::statistics_recycle(StatisticsRecycleRequest& req, Meta
             LOG(WARNING) << "failed to init instance recycler, instance_id=" << id << " ret=" << r;
             continue;
         }
-        // if empty, statistics all resources
-        if (resource_types.empty()) {
-            for (const auto& [_, func] : resource_handlers) {
-                worker_pool->submit([&instance_recycler, &func]() { func(*instance_recycler); });
-            }
-        } else {
-            for (const auto& resource_type : resource_types) {
-                if (auto it = resource_handlers.find(resource_type);
-                    it != resource_handlers.end()) {
-                    worker_pool->submit(
-                            [&it, &instance_recycler]() { it->second(*instance_recycler); });
-                }
-            }
+        for (const auto& task_type : task_types) {
+            const auto& handler = resource_handlers.at(task_type);
+            worker_pool->submit([instance_recycler, handler]() { handler(*instance_recycler); });
         }
     }
 
@@ -220,76 +214,17 @@ void RecyclerServiceImpl::statistics_recycle(StatisticsRecycleRequest& req, Meta
         ss << "Instance ID: " << id << "\n";
         ss << "----------------------------------------\n";
 
-        // tablet and segment statistics
-        int64_t tablet_num = g_bvar_recycler_instance_last_round_to_recycle_num.get(
-                {"global_recycler", "recycle_tablet"});
-        int64_t tablet_bytes = g_bvar_recycler_instance_last_round_to_recycle_num.get(
-                {"global_recycler", "recycle_tablet"});
-        int64_t segment_num = g_bvar_recycler_instance_last_round_to_recycle_num.get(
-                {"global_recycler", "recycle_segment"});
-        int64_t segment_bytes = g_bvar_recycler_instance_last_round_to_recycle_num.get(
-                {"global_recycler", "recycle_segment"});
-        // clang-format off
-        ss << "Global recycler: " << "tablet and segment" << "\n";
-        ss << "  • Need to recycle tablet count: " << tablet_num << " items\n";
-        ss << "  • Need to recycle tablet size: " << tablet_bytes << " bytes\n";
-        ss << "  • Need to recycle segment count: " << segment_num << " items\n";
-        ss << "  • Need to recycle segment size: " << segment_bytes << " bytes\n";
-        // clang-format on
-
-        std::ranges::for_each(resource_types, [&](const auto& resource_type) {
-            int64_t to_recycle_num =
-                    g_bvar_recycler_instance_last_round_to_recycle_num.get({id, resource_type});
-            int64_t to_recycle_bytes =
-                    g_bvar_recycler_instance_last_round_to_recycle_bytes.get({id, resource_type});
-
-            ss << "Task Type: " << resource_type << "\n";
-
-            // Add specific counts for different resource types
-            if (resource_type == "recycle_partitions") {
-                ss << "  • Need to recycle partition count: " << to_recycle_num << " items\n";
-                ss << "  • Need to recycle partition size: " << to_recycle_bytes << " bytes\n";
-            } else if (resource_type == "recycle_rowsets") {
-                ss << "  • Need to recycle rowset count: " << to_recycle_num << " items\n";
-                ss << "  • Need to recycle rowset size: " << to_recycle_bytes << " bytes\n";
-            } else if (resource_type == "recycle_tmp_rowsets") {
-                ss << "  • Need to recycle tmp rowset count: " << to_recycle_num << " items\n";
-                ss << "  • Need to recycle tmp rowset size: " << to_recycle_bytes << " bytes\n";
-            } else if (resource_type == "recycle_indexes") {
-                ss << "  • Need to recycle index count: " << to_recycle_num << " items\n";
-                ss << "  • Need to recycle index size: " << to_recycle_bytes << " bytes\n";
-            } else if (resource_type == "recycle_segment") {
-                ss << "  • Need to recycle segment count: " << to_recycle_num << " items\n";
-                ss << "  • Need to recycle segment size: " << to_recycle_bytes << " bytes\n";
-            } else if (resource_type == "recycle_tablet") {
-                ss << "  • Need to recycle tablet count: " << to_recycle_num << " items\n";
-                ss << "  • Need to recycle tablet size: " << to_recycle_bytes << " bytes\n";
-            } else if (resource_type == "recycle_versions") {
-                ss << "  • Need to recycle version count: " << to_recycle_num << " items\n";
-                ss << "  • Need to recycle version size: " << to_recycle_bytes << " bytes\n";
-            } else if (resource_type == "abort_timeout_txn") {
-                ss << "  • Need to abort timeout txn count: " << to_recycle_num << " items\n";
-                ss << "  • Need to recycle timeout txn size: " << to_recycle_bytes << " bytes\n";
-            } else if (resource_type == "recycle_expired_txn_label") {
-                ss << "  • Need to recycle expired txn label count: " << to_recycle_num
-                   << " items\n";
-                ss << "  • Need to recycle expired txn label size: " << to_recycle_bytes
-                   << " bytes\n";
-            } else if (resource_type == "recycle_copy_jobs") {
-                ss << "  • Need to recycle copy job count: " << to_recycle_num << " items\n";
-                ss << "  • Need to recycle copy job size: " << to_recycle_bytes << " bytes\n";
-            } else if (resource_type == "recycle_stage") {
-                ss << "  • Need to recycle stage count: " << to_recycle_num << " items\n";
-                ss << "  • Need to recycle stage size: " << to_recycle_bytes << " bytes\n";
-            } else if (resource_type == "recycle_expired_stage_objects") {
-                ss << "  • Need to recycle expired stage object count: " << to_recycle_num
-                   << " items\n";
-                ss << "  • Need to recycle expired stage object size: " << to_recycle_bytes
-                   << " bytes\n";
-            } else {
-                ss << "  • Need to recycle count: " << to_recycle_num << " items\n";
-                ss << "  • Need to recycle size: " << to_recycle_bytes << " bytes\n";
-            }
+        std::ranges::for_each(task_types, [&](const auto& task_type) {
+            const int64_t scanned_num =
+                    g_bvar_recycler_instance_recycle_current_round_kv_scanned.get({id, task_type});
+            const int64_t expired_num =
+                    g_bvar_recycler_instance_recycle_current_round_kv_expired.get({id, task_type});
+            const int64_t recycled_num =
+                    g_bvar_recycler_instance_recycle_current_round_kv_recycled.get({id, task_type});
+            ss << "Task Type: " << task_type << "\n";
+            ss << "  • Scanned KV count: " << scanned_num << " items\n";
+            ss << "  • Expired KV count: " << expired_num << " items\n";
+            ss << "  • Recycled KV count: " << recycled_num << " items\n";
 
             ss << "----------------------------------------\n";
         });
