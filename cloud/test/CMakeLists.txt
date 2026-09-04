@@ -65,6 +65,7 @@ add_executable(meta_service_test
    schema_kv_test.cpp
    compaction_rw_separation_test.cpp
 )
+add_thirdparty(roaring NOTADD)
 
 add_executable(meta_server_test meta_server_test.cpp)
 
@@ -159,7 +160,7 @@ target_link_libraries(keys_test ${TEST_LINK_LIBS})
 
 target_link_libraries(meta_reader_test ${TEST_LINK_LIBS})
 
-target_link_libraries(meta_service_test ${TEST_LINK_LIBS})
+target_link_libraries(meta_service_test ${TEST_LINK_LIBS} roaring)
 
 target_link_libraries(meta_server_test ${TEST_LINK_LIBS})
 

@@ -32,6 +32,7 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <roaring/roaring.hh>
 #include <string>
 #include <thread>
 
@@ -7175,6 +7176,164 @@ void update_delete_bitmap_with_remove_pre(MetaServiceProxy* meta_service, int64_
         ASSERT_EQ(get_delete_bitmap_res.versions(i), std::get<2>(expected_dm[i]));
         ASSERT_EQ(get_delete_bitmap_res.segment_delete_bitmaps(i), std::get<3>(expected_dm[i]));
     }
+}
+
+TEST(MetaServiceTest, UpdateDeleteBitmapPreRowsetDelayedReplayRestoresOldVersion) {
+    auto meta_service = get_meta_service();
+    constexpr int64_t table_id = 112;
+    constexpr int64_t partition_id = 123;
+    constexpr int64_t tablet_id = 333;
+    constexpr int64_t pre_rowset_version = 91;
+    constexpr std::string_view rowset_id = "100091";
+    constexpr std::string_view cloud_unique_id = "test_cloud_unique_id";
+    const auto instance_id = get_instance_id(meta_service->resource_mgr(), cloud_unique_id.data());
+
+    auto serialize_bitmap = [](uint32_t row_id) {
+        roaring::Roaring bitmap;
+        bitmap.add(row_id);
+        std::string serialized(bitmap.getSizeInBytes(), '\0');
+        bitmap.write(serialized.data());
+        return serialized;
+    };
+
+    // Keep the pre-rowset metadata at version [0, 91] throughout the test. The
+    // pre_rowset_versions field below refers to this metadata version, not a DBM version.
+    {
+        doris::RowsetMetaCloudPB pre_rowset;
+        pre_rowset.set_rowset_id(0);
+        pre_rowset.set_rowset_id_v2(std::string(rowset_id));
+        pre_rowset.set_tablet_id(tablet_id);
+        pre_rowset.set_partition_id(partition_id);
+        pre_rowset.set_start_version(0);
+        pre_rowset.set_end_version(pre_rowset_version);
+        pre_rowset.set_num_segments(1);
+        pre_rowset.mutable_tablet_schema()->set_schema_version(0);
+
+        std::string rowset_value;
+        ASSERT_TRUE(pre_rowset.SerializeToString(&rowset_value));
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(meta_service->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+        txn->put(meta_rowset_key({instance_id, tablet_id, pre_rowset_version}), rowset_value);
+        ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+    }
+
+    auto submit_update_delete_bitmap_request = [&](const UpdateDeleteBitmapRequest& request) {
+        brpc::Controller cntl;
+        UpdateDeleteBitmapResponse response;
+        meta_service->update_delete_bitmap(
+                reinterpret_cast<google::protobuf::RpcController*>(&cntl), &request, &response,
+                nullptr);
+        ASSERT_EQ(response.status().code(), MetaServiceCode::OK)
+                << response.status().ShortDebugString();
+    };
+
+    auto build_pre_rowset_aggregation_request = [&](int64_t dbm_version, const std::string& bitmap,
+                                                    int64_t aggregation_end_version) {
+        UpdateDeleteBitmapRequest request;
+        request.set_cloud_unique_id(std::string(cloud_unique_id));
+        request.set_table_id(table_id);
+        request.set_partition_id(partition_id);
+        request.set_tablet_id(tablet_id);
+        request.set_lock_id(COMPACTION_WITHOUT_LOCK_DELETE_BITMAP_LOCK_ID);
+        request.set_initiator(-1);
+        request.set_without_lock(true);
+        request.set_store_version(1); // Exercise the v1 delete-bitmap storage path.
+        request.add_rowset_ids(std::string(rowset_id));
+        request.add_segment_ids(0);
+        request.add_versions(dbm_version);
+        request.add_segment_delete_bitmaps(bitmap);
+        request.add_pre_rowset_versions(pre_rowset_version);
+        request.set_pre_rowset_agg_start_version(92);
+        request.set_pre_rowset_agg_end_version(aggregation_end_version);
+        return request;
+    };
+
+    auto assert_delete_bitmap_value = [&](int64_t dbm_version, const std::string& expected) {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(meta_service->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+        ValueBuf value;
+        auto key = meta_delete_bitmap_key(
+                {instance_id, tablet_id, std::string(rowset_id), dbm_version, 0});
+        ASSERT_EQ(cloud::blob_get(txn.get(), key, &value), TxnErrorCode::TXN_OK)
+                << "version=" << dbm_version;
+        ASSERT_EQ(value.value(), expected) << "version=" << dbm_version;
+    };
+
+    auto assert_delete_bitmap_absent = [&](int64_t dbm_version) {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(meta_service->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+        ValueBuf value;
+        auto key = meta_delete_bitmap_key(
+                {instance_id, tablet_id, std::string(rowset_id), dbm_version, 0});
+        ASSERT_EQ(cloud::blob_get(txn.get(), key, &value), TxnErrorCode::TXN_KEY_NOT_FOUND)
+                << "version=" << dbm_version;
+    };
+
+    auto assert_pre_rowset_metadata_exists = [&] {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(meta_service->txn_kv()->create_txn(&txn), TxnErrorCode::TXN_OK);
+        std::string value;
+        ASSERT_EQ(txn->get(meta_rowset_key({instance_id, tablet_id, pre_rowset_version}), &value),
+                  TxnErrorCode::TXN_OK);
+        doris::RowsetMetaCloudPB rowset;
+        ASSERT_TRUE(rowset.ParseFromString(value));
+        ASSERT_EQ(rowset.rowset_id_v2(), rowset_id);
+        ASSERT_EQ(rowset.start_version(), 0);
+        ASSERT_EQ(rowset.end_version(), pre_rowset_version);
+        ASSERT_EQ(rowset.num_segments(), 1);
+    };
+
+    const auto dbm_92 = serialize_bitmap(92);
+    const auto dbm_110 = serialize_bitmap(110);
+    const auto dbm_163 = serialize_bitmap(163);
+    const auto dbm_180 = serialize_bitmap(180);
+
+    // Seed historical DBMs 100091@92 and 100091@110.
+    {
+        UpdateDeleteBitmapRequest request;
+        request.set_cloud_unique_id(std::string(cloud_unique_id));
+        request.set_table_id(table_id);
+        request.set_partition_id(partition_id);
+        request.set_tablet_id(tablet_id);
+        request.set_lock_id(COMPACTION_WITHOUT_LOCK_DELETE_BITMAP_LOCK_ID);
+        request.set_initiator(-1);
+        request.set_without_lock(true);
+        request.set_store_version(1);
+        for (const auto& [version, bitmap] :
+             std::vector<std::pair<int64_t, std::string>> {{92, dbm_92}, {110, dbm_110}}) {
+            request.add_rowset_ids(std::string(rowset_id));
+            request.add_segment_ids(0);
+            request.add_versions(version);
+            request.add_segment_delete_bitmaps(bitmap);
+        }
+        submit_update_delete_bitmap_request(request);
+    }
+    assert_pre_rowset_metadata_exists();
+    assert_delete_bitmap_value(92, dbm_92);
+    assert_delete_bitmap_value(110, dbm_110);
+
+    // Q163: [92, 163) is the aggregation cleanup range, while 163 is the DBM
+    // version being written and 91 is the rowset metadata lookup version.
+    const auto q163 = build_pre_rowset_aggregation_request(163, dbm_163, 163);
+    submit_update_delete_bitmap_request(q163);
+    assert_delete_bitmap_absent(92);
+    assert_delete_bitmap_absent(110);
+    assert_delete_bitmap_value(163, dbm_163);
+    assert_delete_bitmap_absent(180);
+    assert_pre_rowset_metadata_exists();
+
+    // Q180 advances the aggregation cleanup range to [92, 180) and writes DBM 180.
+    const auto q180 = build_pre_rowset_aggregation_request(180, dbm_180, 180);
+    submit_update_delete_bitmap_request(q180);
+    assert_delete_bitmap_absent(163);
+    assert_delete_bitmap_value(180, dbm_180);
+    assert_pre_rowset_metadata_exists();
+
+    // Replay the exact original Q163 request. It must restore 163 without removing 180.
+    submit_update_delete_bitmap_request(q163);
+    assert_delete_bitmap_value(163, dbm_163);
+    assert_delete_bitmap_value(180, dbm_180);
+    assert_pre_rowset_metadata_exists();
 }
 
 TEST(MetaServiceTest, UpdateDeleteBitmapWithRemovePreDeleteBitmap) {
