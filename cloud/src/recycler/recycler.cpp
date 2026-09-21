@@ -6741,18 +6741,20 @@ int InstanceRecycler::recycle_tmp_rowsets() {
                                      std::move(tmp_rowset_ref_count_keys_to_delete),
                              mark_keys_to_process = std::move(mark_keys_to_process),
                              abort_keys_to_process = std::move(abort_keys_to_process)]() mutable {
+            std::vector<std::vector<std::string>> versioned_delete_bitmap_key_groups;
             if (delete_rowset_data(tmp_rowsets_to_delete, RowsetRecyclingState::TMP_ROWSET,
-                                   metrics_context) != 0) {
-                LOG(WARNING) << "failed to delete tmp rowset data, instance_id=" << instance_id_;
+                                   metrics_context, &versioned_delete_bitmap_key_groups) != 0) {
+                LOG(WARNING) << "failed to delete rowset data, instance_id=" << instance_id_;
+                return;
+            }
+            if (!versioned_delete_bitmap_key_groups.empty() &&
+                delete_versioned_delete_bitmap_by_rowset(txn_kv_.get(),
+                                                         versioned_delete_bitmap_key_groups) != 0) {
+                LOG(WARNING) << "failed to delete versioned delete bitmap kv, instance_id="
+                             << instance_id_;
                 return;
             }
             for (const auto& [_, rs] : tmp_rowsets_to_delete) {
-                if (delete_versioned_delete_bitmap_kvs(rs.partition_id(), rs.tablet_id(),
-                                                       rs.rowset_id_v2()) != 0) {
-                    LOG(WARNING) << "failed to delete versioned delete bitmap kv, rs="
-                                 << rs.ShortDebugString();
-                    return;
-                }
                 if (delete_delete_bitmap_kvs(rs.tablet_id(), rs.rowset_id_v2()) != 0) {
                     LOG(WARNING) << "failed to delete delete bitmap kv, rs="
                                  << rs.ShortDebugString();

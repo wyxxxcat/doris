@@ -2952,6 +2952,79 @@ TEST(RecyclerTest, recycle_tmp_rowsets) {
     }
 }
 
+TEST(RecyclerTest, recycle_tmp_rowsets_deletes_only_existing_versioned_delete_bitmaps) {
+    auto old_retention_seconds = config::retention_seconds;
+    auto old_worker_pool_size = config::instance_recycler_worker_pool_size;
+    config::retention_seconds = 0;
+    config::instance_recycler_worker_pool_size = 1;
+    DORIS_CLOUD_DEFER {
+        config::retention_seconds = old_retention_seconds;
+        config::instance_recycler_worker_pool_size = old_worker_pool_size;
+        SyncPoint::get_instance()->clear_all_call_backs();
+    };
+
+    std::atomic<int> delete_bitmap_commit_count {0};
+    auto* sp = SyncPoint::get_instance();
+    sp->set_call_back("delete_versioned_delete_bitmap_by_rowset::commit_result",
+                      [&](auto&&) { ++delete_bitmap_commit_count; });
+    sp->enable_processing();
+
+    struct TestCase {
+        bool has_delete_bitmap;
+        int expected_commit_count;
+    };
+    for (const auto& test_case :
+         {TestCase {.has_delete_bitmap = true, .expected_commit_count = 1},
+          TestCase {.has_delete_bitmap = false, .expected_commit_count = 0}}) {
+        SCOPED_TRACE(test_case.has_delete_bitmap ? "with delete bitmap" : "without delete bitmap");
+
+        auto txn_kv = std::make_shared<MemTxnKv>();
+        ASSERT_EQ(txn_kv->init(), 0);
+
+        const std::string resource_id =
+                fmt::format("recycle_tmp_rowset_versioned_dbm_{}",
+                            test_case.has_delete_bitmap ? "present" : "absent");
+        InstanceInfoPB instance;
+        instance.set_instance_id(instance_id);
+        instance.set_multi_version_status(MULTI_VERSION_WRITE_ONLY);
+        auto* obj_info = instance.add_obj_info();
+        obj_info->set_id(resource_id);
+        obj_info->set_ak(config::test_s3_ak);
+        obj_info->set_sk(config::test_s3_sk);
+        obj_info->set_endpoint(config::test_s3_endpoint);
+        obj_info->set_region(config::test_s3_region);
+        obj_info->set_bucket(config::test_s3_bucket);
+        obj_info->set_prefix(resource_id);
+
+        InstanceRecycler recycler(txn_kv, instance, thread_group,
+                                  std::make_shared<TxnLazyCommitter>(txn_kv));
+        ASSERT_EQ(recycler.init(), 0);
+
+        doris::TabletSchemaCloudPB schema;
+        schema.set_schema_version(1);
+        schema.set_inverted_index_storage_format(InvertedIndexStorageFormatPB::V1);
+        const int64_t tablet_id = test_case.has_delete_bitmap ? 21001 : 21002;
+        const int64_t txn_id = test_case.has_delete_bitmap ? 31001 : 31002;
+        auto rowset = create_rowset(resource_id, tablet_id, 11001, 1, schema, txn_id);
+        auto accessor = recycler.accessor_map_.begin()->second;
+        ASSERT_EQ(create_tmp_rowset(txn_kv.get(), accessor.get(), rowset, false, false,
+                                    test_case.has_delete_bitmap),
+                  0);
+        check_delete_bitmap_keys_size(txn_kv.get(), tablet_id, test_case.has_delete_bitmap ? 1 : 0);
+
+        delete_bitmap_commit_count = 0;
+        ASSERT_EQ(recycler.recycle_tmp_rowsets(), 0);
+
+        EXPECT_EQ(delete_bitmap_commit_count.load(), test_case.expected_commit_count);
+        check_delete_bitmap_keys_size(txn_kv.get(), tablet_id, 0);
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+        std::string value;
+        EXPECT_EQ(txn->get(meta_rowset_tmp_key({instance_id, txn_id, tablet_id}), &value),
+                  TxnErrorCode::TXN_KEY_NOT_FOUND);
+    }
+}
+
 TEST(RecyclerTest, recycle_tmp_rowsets_partial_update) {
     config::retention_seconds = 0;
     auto txn_kv = std::make_shared<MemTxnKv>();
