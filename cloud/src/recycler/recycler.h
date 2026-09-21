@@ -589,6 +589,10 @@ private:
     int classify_rowset_task_by_ref_count(RowsetDeleteTask& task,
                                           std::vector<RowsetDeleteTask>& batch_delete_tasks);
 
+    // Check that a versioned rowset task still points to the exact persisted rowset version.
+    TxnErrorCode validate_versioned_rowset_task(Transaction* txn, const RowsetDeleteTask& task,
+                                                bool* valid);
+
     // Cleanup metadata for deleted rowsets, return 0 for success otherwise error
     int cleanup_rowset_metadata(const std::vector<RowsetDeleteTask>& tasks);
 

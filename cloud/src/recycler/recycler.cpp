@@ -6481,6 +6481,20 @@ int InstanceRecycler::recycle_rowset_meta_and_data(const RowsetDeleteTask& task)
             return -1;
         }
 
+        bool valid_task = true;
+        err = validate_versioned_rowset_task(txn.get(), task, &valid_task);
+        if (err != TxnErrorCode::TXN_OK) {
+            LOG_WARNING("failed to validate rowset task").tag("err", err);
+            return -1;
+        }
+        if (!valid_task) {
+            LOG_INFO("rowset task has already been processed")
+                    .tag("tablet_id", tablet_id)
+                    .tag("rowset_id", rowset_id)
+                    .tag("versioned_rowset_key", hex(task.versioned_rowset_key));
+            return 0;
+        }
+
         std::string rowset_ref_count_key =
                 versioned::data_rowset_ref_count_key({reference_instance_id, tablet_id, rowset_id});
         int64_t ref_count = 0;
@@ -8528,6 +8542,24 @@ int InstanceRecycler::classify_rowset_task_by_ref_count(
             return -1;
         }
 
+        bool valid_task = true;
+        err = validate_versioned_rowset_task(txn.get(), task, &valid_task);
+        if (err != TxnErrorCode::TXN_OK) {
+            LOG_WARNING("failed to validate rowset task when classifying")
+                    .tag("instance_id", instance_id_)
+                    .tag("tablet_id", tablet_id)
+                    .tag("rowset_id", rowset_id)
+                    .tag("err", err);
+            return -1;
+        }
+        if (!valid_task) {
+            LOG_INFO("rowset task has already been processed")
+                    .tag("instance_id", instance_id_)
+                    .tag("tablet_id", tablet_id)
+                    .tag("rowset_id", rowset_id);
+            return 1;
+        }
+
         std::string rowset_ref_count_key =
                 versioned::data_rowset_ref_count_key({reference_instance_id, tablet_id, rowset_id});
         task.rowset_ref_count_key = rowset_ref_count_key;
@@ -8576,6 +8608,13 @@ int InstanceRecycler::classify_rowset_task_by_ref_count(
                         .tag("key", hex(task.non_versioned_rowset_key));
             }
 
+            if (!task.versioned_rowset_key.empty()) {
+                versioned::document_remove<RowsetMetaCloudPB>(txn.get(), task.versioned_rowset_key,
+                                                              task.versionstamp);
+                LOG_INFO("remove versioned meta rowset key in classification phase")
+                        .tag("key", hex(task.versioned_rowset_key));
+            }
+
             err = txn->commit();
             if (err == TxnErrorCode::TXN_CONFLICT) {
                 VLOG_DEBUG << "decrease rowset ref count but txn conflict in classification, retry"
@@ -8613,6 +8652,46 @@ int InstanceRecycler::classify_rowset_task_by_ref_count(
             .tag("rowset_id", rowset_id)
             .tag("retry", MAX_RETRY);
     return -1;
+}
+
+TxnErrorCode InstanceRecycler::validate_versioned_rowset_task(Transaction* txn,
+                                                              const RowsetDeleteTask& task,
+                                                              bool* valid) {
+    if (task.versioned_rowset_key.empty()) {
+        if (task.recycle_rowset_key.empty()) {
+            *valid = true;
+            return TxnErrorCode::TXN_OK;
+        }
+
+        std::string value;
+        TxnErrorCode err = txn->get(task.recycle_rowset_key, &value);
+        if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+            *valid = false;
+            return TxnErrorCode::TXN_OK;
+        }
+        if (err != TxnErrorCode::TXN_OK) {
+            return err;
+        }
+        *valid = true;
+        return TxnErrorCode::TXN_OK;
+    }
+
+    RowsetMetaCloudPB current_meta;
+    Versionstamp current_version;
+    TxnErrorCode err = versioned::document_get(txn, task.versioned_rowset_key,
+                                               Versionstamp::next(task.versionstamp), &current_meta,
+                                               &current_version);
+    if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        *valid = false;
+        return TxnErrorCode::TXN_OK;
+    }
+    if (err != TxnErrorCode::TXN_OK) {
+        return err;
+    }
+
+    *valid = current_version == task.versionstamp &&
+             current_meta.rowset_id_v2() == task.rowset_meta.rowset_id_v2();
+    return TxnErrorCode::TXN_OK;
 }
 
 int InstanceRecycler::cleanup_rowset_metadata(const std::vector<RowsetDeleteTask>& tasks) {

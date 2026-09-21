@@ -2107,6 +2107,37 @@ TEST(RecycleVersionedKeysTest, BatchDeleteRefCountGreaterThanOne) {
         }
         EXPECT_EQ(count, 0) << "recycle_rowset keys should be removed for ref_count > 1 case";
     }
+
+    // Rebuilding the recycler must not process the same versioned rowset references again.
+    auto retry_recycler = get_instance_recycler(meta_service.get(), instance_info, accessor);
+    RecyclerMetricsContext retry_ctx;
+    ASSERT_EQ(0, retry_recycler->recycle_tablet(tablet_id, retry_ctx));
+
+    {
+        std::unique_ptr<ListIterator> list_iter;
+        ASSERT_EQ(0, accessor->list_directory(tablet_path_prefix(tablet_id), &list_iter));
+        size_t file_count = 0;
+        while (list_iter->has_next()) {
+            list_iter->next();
+            ++file_count;
+        }
+        EXPECT_EQ(file_count, num_rowsets)
+                << "Retry must not delete data for the remaining shared references";
+    }
+
+    {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+        for (const auto& rowset_id : rowset_ids) {
+            auto ref_count_key =
+                    versioned::data_rowset_ref_count_key({instance_id, tablet_id, rowset_id});
+            std::string value;
+            ASSERT_EQ(txn->get(ref_count_key, &value), TxnErrorCode::TXN_OK);
+            int64_t ref_count = 0;
+            ASSERT_TRUE(txn->decode_atomic_int(value, &ref_count));
+            EXPECT_EQ(ref_count, 1) << "Retry must not decrement the remaining reference";
+        }
+    }
 }
 
 // Test: Mixed ref_count scenario - some rowsets have ref_count==1, others have ref_count>1
