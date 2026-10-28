@@ -7061,11 +7061,6 @@ int InstanceRecycler::recycle_expired_txn_label() {
 
     int64_t earlest_ts = std::numeric_limits<int64_t>::max();
 
-    SyncExecutor<int> concurrent_delete_executor(
-            _thread_pool_group.s3_producer_pool,
-            fmt::format("recycle expired txn label, instance id {}", instance_id_),
-            [](const int& ret) { return ret != 0; });
-
     int64_t current_time_ms =
             duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 
@@ -7230,8 +7225,11 @@ int InstanceRecycler::recycle_expired_txn_label() {
             return ret;
         };
 
+        std::atomic<bool> has_error {false};
+        SimpleThreadPool worker_pool(config::instance_recycler_worker_pool_size, "recycle_txn");
+        worker_pool.start();
         for (auto& [label_key, txn_keys] : recycle_txn_keys_by_label) {
-            concurrent_delete_executor.add([&, txn_keys = std::move(txn_keys), label_key]() {
+            worker_pool.submit([&, txn_keys = std::move(txn_keys), label_key]() {
                 VLOG_DEBUG << "recycle txn label group, key=" << hex(label_key)
                            << " txn_count=" << txn_keys.size();
                 for (const auto& k : txn_keys) {
@@ -7241,21 +7239,16 @@ int InstanceRecycler::recycle_expired_txn_label() {
                                 .tag("instance id", instance_id_)
                                 .tag("key", hex(k))
                                 .tag("label_key", hex(label_key));
-                        return -1;
+                        has_error = true;
+                        return;
                     }
                 }
-                return 0;
             });
         }
-        bool finished = true;
-        std::vector<int> rets = concurrent_delete_executor.when_all(&finished);
-        for (int r : rets) {
-            if (r != 0) {
-                ret = -1;
-            }
+        worker_pool.stop();
+        if (has_error.load()) {
+            ret = -1;
         }
-
-        ret = finished ? ret : -1;
 
         // Update metrics after all concurrent tasks completed
         metrics_context.total_recycled_num = num_recycled.load();
@@ -7264,10 +7257,7 @@ int InstanceRecycler::recycle_expired_txn_label() {
         TEST_SYNC_POINT_CALLBACK("InstanceRecycler::recycle_expired_txn_label.failure", &ret);
 
         if (ret != 0) {
-            LOG_WARNING("recycle txn kv ret!=0")
-                    .tag("finished", finished)
-                    .tag("ret", ret)
-                    .tag("instance_id", instance_id_);
+            LOG_WARNING("recycle txn kv ret!=0").tag("ret", ret).tag("instance_id", instance_id_);
             return ret;
         }
         return ret;

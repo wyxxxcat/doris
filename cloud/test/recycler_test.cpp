@@ -9827,6 +9827,78 @@ TEST(RecyclerTest, concurrent_recycle_txn_label_failure_test) {
               << "ms" << std::endl;
     check_multiple_txn_info_kvs(txn_kv, (40000 - recycle_txn_keys_cnt));
 }
+
+TEST(RecyclerTest, recycle_txn_label_continue_after_task_failure_test) {
+    const auto old_worker_pool_size = config::instance_recycler_worker_pool_size;
+    const auto old_label_keep_max_second = config::label_keep_max_second;
+    DORIS_CLOUD_DEFER {
+        config::instance_recycler_worker_pool_size = old_worker_pool_size;
+        config::label_keep_max_second = old_label_keep_max_second;
+    };
+    config::instance_recycler_worker_pool_size = 1;
+    config::label_keep_max_second = 0;
+
+    auto s3_producer_pool = std::make_shared<SimpleThreadPool>(1);
+    s3_producer_pool->start();
+    RecyclerThreadPoolGroup recycle_txn_label_thread_group(
+            s3_producer_pool, thread_group.recycle_tablet_pool,
+            thread_group.group_recycle_function_pool);
+
+    auto txn_kv = std::make_shared<MemTxnKv>();
+    ASSERT_EQ(txn_kv->init(), 0);
+    constexpr int64_t txn_count = 6;
+    for (int64_t i = 0; i < txn_count; ++i) {
+        make_single_txn_related_kvs(txn_kv, i, txn_count);
+    }
+
+    auto* sp = SyncPoint::get_instance();
+    DORIS_CLOUD_DEFER {
+        sp->clear_all_call_backs();
+        sp->disable_processing();
+    };
+    std::string failed_label_key;
+    sp->set_call_back(
+            "InstanceRecycler::recycle_expired_txn_label.check_recycle_txn_keys_by_label",
+            [&](auto&& args) {
+                auto* groups =
+                        try_any_cast<std::unordered_map<std::string, std::vector<std::string>>*>(
+                                args[0]);
+                ASSERT_EQ(groups->size(), txn_count);
+                // Fail the first submitted task while other labels are still queued.
+                failed_label_key = groups->begin()->first;
+                std::unique_ptr<Transaction> txn;
+                ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+                std::string malformed_label(1, '\x80');
+                malformed_label.append(VERSION_STAMP_LEN, '\0');
+                txn->put(failed_label_key, malformed_label);
+                ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+            });
+    sp->enable_processing();
+
+    InstanceInfoPB instance;
+    instance.set_instance_id(instance_id);
+    InstanceRecycler recycler(txn_kv, instance, recycle_txn_label_thread_group,
+                              std::make_shared<TxnLazyCommitter>(txn_kv));
+    ASSERT_EQ(recycler.init(), 0);
+    ASSERT_EQ(recycler.recycle_expired_txn_label(), -1);
+    ASSERT_FALSE(failed_label_key.empty());
+
+    std::unique_ptr<Transaction> verify_txn;
+    ASSERT_EQ(txn_kv->create_txn(&verify_txn), TxnErrorCode::TXN_OK);
+    for (int64_t i = 0; i < txn_count; ++i) {
+        const int64_t txn_id = 1000000 + i;
+        const auto label_key = txn_label_key({instance_id, i, "txn_label_" + std::to_string(i)});
+        const auto expected = label_key == failed_label_key ? TxnErrorCode::TXN_OK
+                                                            : TxnErrorCode::TXN_KEY_NOT_FOUND;
+        std::string value;
+        EXPECT_EQ(verify_txn->get(recycle_txn_key({instance_id, i, txn_id}), &value), expected);
+        EXPECT_EQ(verify_txn->get(txn_info_key({instance_id, i, txn_id}), &value), expected);
+        EXPECT_EQ(verify_txn->get(txn_index_key({instance_id, txn_id}), &value), expected);
+        EXPECT_EQ(verify_txn->get(txn_index_key({instance_id, 2000000 + i}), &value), expected);
+        EXPECT_EQ(verify_txn->get(label_key, &value), expected);
+    }
+}
+
 TEST(RecyclerTest, concurrent_recycle_txn_label_conflict_test) {
     config::label_keep_max_second = 0;
     config::recycle_pool_parallelism = 20;
