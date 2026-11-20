@@ -83,7 +83,7 @@ int prepare_instance_recycle_tasks(TxnKv* txn_kv, std::string_view key,
  */
 void finish_instance_recycle_task(TxnKv* txn_kv, std::string_view key,
                                   const std::string& instance_id, const std::string& ip_port,
-                                  const std::string& task_name, bool success,
+                                  const std::string& task_name, bool success, int64_t ctime_ms = 0,
                                   bool abort_release = false);
 
 /**

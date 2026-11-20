@@ -361,7 +361,8 @@ int prepare_instance_recycle_tasks(TxnKv* txn_kv, std::string_view key,
 
 void finish_instance_recycle_task(TxnKv* txn_kv, std::string_view key,
                                   const std::string& instance_id, const std::string& ip_port,
-                                  const std::string& task_name, bool success, bool abort_release) {
+                                  const std::string& task_name, bool success, int64_t ctime_ms,
+                                  bool abort_release) {
     constexpr int kMaxFinishRetries = 10;
     for (int retry_times = 0; retry_times < kMaxFinishRetries; ++retry_times) {
         std::unique_ptr<Transaction> txn;
@@ -400,6 +401,12 @@ void finish_instance_recycle_task(TxnKv* txn_kv, std::string_view key,
         }
         if (task_pb->status() != JobRecyclePB::BUSY) {
             LOG(WARNING) << "recycle task is not busy, task=" << task_name << " key=" << hex(key);
+            return;
+        }
+        if (ctime_ms > 0 && task_pb->last_ctime_ms() != ctime_ms) {
+            LOG(WARNING) << "recycle task ctime mismatch, expected=" << ctime_ms
+                         << " actual=" << task_pb->last_ctime_ms() << " task=" << task_name
+                         << " key=" << hex(key);
             return;
         }
 

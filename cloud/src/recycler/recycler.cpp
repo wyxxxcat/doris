@@ -460,6 +460,7 @@ void Recycler::recycle_callback() {
 void Recycler::schedule_distributed_tasks(const InstanceInfoPB& instance) {
     const auto& instance_id = instance.instance_id();
     std::vector<std::string> active_tasks;
+    std::shared_ptr<InstanceRecycler> instance_recycler;
     {
         std::lock_guard lock(mtx_);
         if (auto it = recycling_instance_map_.find(instance_id);
@@ -468,6 +469,7 @@ void Recycler::schedule_distributed_tasks(const InstanceInfoPB& instance) {
                 return;
             }
             active_tasks = it->second->get_active_distributed_tasks();
+            instance_recycler = it->second;
         }
     }
 
@@ -484,12 +486,24 @@ void Recycler::schedule_distributed_tasks(const InstanceInfoPB& instance) {
         return;
     }
 
+    // Initialize accessor before claiming lease in FDB
+    if (!instance_recycler) {
+        instance_recycler = std::make_shared<InstanceRecycler>(
+                txn_kv_, instance, _thread_pool_group, txn_lazy_committer_);
+        if (int r = instance_recycler->init(); r != 0) {
+            LOG(WARNING) << "failed to init instance recycler, instance_id=" << instance_id
+                         << " ret=" << r;
+            return;
+        }
+    }
+
     std::string recycle_job_key;
     job_recycle_key({instance_id}, &recycle_job_key);
     std::vector<std::string> claimed_tasks;
+    int64_t ctime_ms = 0;
     int ret = prepare_instance_recycle_tasks(txn_kv_.get(), recycle_job_key, instance_id, ip_port_,
                                              config::recycle_interval_seconds * 1000,
-                                             candidate_tasks, &claimed_tasks);
+                                             candidate_tasks, &claimed_tasks, &ctime_ms);
     if (ret != 0) {
         if (ret < 0) {
             LOG(WARNING) << "failed to prepare distributed recycle tasks, instance_id="
@@ -502,20 +516,10 @@ void Recycler::schedule_distributed_tasks(const InstanceInfoPB& instance) {
     auto release_claimed_tasks = [&](const std::vector<std::string>& tasks) {
         for (const auto& task_name : tasks) {
             finish_instance_recycle_task(txn_kv_.get(), recycle_job_key, instance_id, ip_port_,
-                                         task_name, false, /*abort_release=*/true);
+                                         task_name, false, ctime_ms, /*abort_release=*/true);
         }
     };
 
-    auto task_recycler = std::make_shared<InstanceRecycler>(txn_kv_, instance, _thread_pool_group,
-                                                            txn_lazy_committer_);
-    if (int r = task_recycler->init(); r != 0) {
-        LOG(WARNING) << "failed to init instance recycler, instance_id=" << instance_id
-                     << " ret=" << r;
-        release_claimed_tasks(claimed_tasks);
-        return;
-    }
-
-    std::shared_ptr<InstanceRecycler> instance_recycler = task_recycler;
     bool need_release = false;
     std::unordered_map<std::string, std::shared_ptr<std::atomic_bool>> task_stop_tokens;
     {
@@ -536,8 +540,8 @@ void Recycler::schedule_distributed_tasks(const InstanceInfoPB& instance) {
         }
         if (!need_release) {
             for (const auto& task_name : claimed_tasks) {
-                task_stop_tokens.emplace(task_name,
-                                         instance_recycler->add_distributed_task(task_name));
+                task_stop_tokens.emplace(
+                        task_name, instance_recycler->add_distributed_task(task_name, ctime_ms));
             }
         }
     }
@@ -546,9 +550,9 @@ void Recycler::schedule_distributed_tasks(const InstanceInfoPB& instance) {
         return;
     }
 
-    task_recycler->reset_metrics();
+    instance_recycler->reset_metrics();
     std::shared_ptr<void> metrics_guard(
-            nullptr, [task_recycler](void*) { task_recycler->finish_report_metrics(); });
+            nullptr, [instance_recycler](void*) { instance_recycler->finish_report_metrics(); });
 
     auto complete_distributed_task = [this, instance_id,
                                       instance_recycler](const std::string& task_name) {
@@ -567,30 +571,34 @@ void Recycler::schedule_distributed_tasks(const InstanceInfoPB& instance) {
             std::lock_guard lease_lock(instance_recycler->task_lease_mutex());
             if (instance_recycler->begin_finish_distributed_task(task_name)) {
                 finish_instance_recycle_task(txn_kv_.get(), recycle_job_key, instance_id, ip_port_,
-                                             task_name, false, /*abort_release=*/true);
+                                             task_name, false, ctime_ms, /*abort_release=*/true);
             }
         }
         complete_distributed_task(task_name);
     };
 
     for (const auto& task_name : claimed_tasks) {
-        auto task_func = task_recycler->get_recycle_task(task_name);
+        auto task_func = instance_recycler->get_recycle_task(task_name);
+        if (!task_func) {
+            LOG(WARNING) << "recycle task not found: " << task_name
+                         << " instance_id=" << instance_id;
+            abort_and_release_task(task_name);
+            continue;
+        }
+
         LOG(INFO) << "begin to recycle distributed task, instance_id=" << instance_id
                   << " task=" << task_name;
         g_bvar_recycler_instance_recycle_task_status.put({"submitted"}, 1);
         auto stop_token = std::move(task_stop_tokens[task_name]);
         int submit_ret = _thread_pool_group.group_recycle_function_pool->submit_with_timeout(
-                [this, instance_id, recycle_job_key, instance_recycler, task_recycler,
-                 metrics_guard, task_name, task_func = std::move(task_func),
-                 stop_token = std::move(stop_token), complete_distributed_task]() {
+                [this, instance_id, recycle_job_key, instance_recycler, metrics_guard, task_name,
+                 ctime_ms, task_func = std::move(task_func), stop_token = std::move(stop_token),
+                 complete_distributed_task]() {
                     DORIS_CLOUD_DEFER {
                         complete_distributed_task(task_name);
                     };
                     InstanceRecycler::ScopedTaskStopToken scoped_stop(stop_token.get());
-                    int task_ret =
-                            (stopped() || instance_recycler->stopped() || task_recycler->stopped())
-                                    ? -1
-                                    : task_func();
+                    int task_ret = (stopped() || instance_recycler->stopped()) ? -1 : task_func();
                     bool should_finish = false;
                     {
                         std::lock_guard lease_lock(instance_recycler->task_lease_mutex());
@@ -598,12 +606,11 @@ void Recycler::schedule_distributed_tasks(const InstanceInfoPB& instance) {
                         if (should_finish) {
                             finish_instance_recycle_task(txn_kv_.get(), recycle_job_key,
                                                          instance_id, ip_port_, task_name,
-                                                         task_ret == 0,
+                                                         task_ret == 0, ctime_ms,
                                                          /*abort_release=*/false);
                         }
                     }
-                    if (!should_finish || instance_recycler->stopped() ||
-                        task_recycler->stopped() || task_ret != 0) {
+                    if (!should_finish || instance_recycler->stopped() || task_ret != 0) {
                         g_bvar_recycler_instance_recycle_task_status.put({"error"}, 1);
                     } else {
                         auto now =
@@ -8086,13 +8093,14 @@ void InstanceRecycler::unregister_recycle_task(const std::string& task_name) {
 }
 
 std::shared_ptr<std::atomic_bool> InstanceRecycler::add_distributed_task(
-        const std::string& task_name) {
+        const std::string& task_name, int64_t ctime_ms) {
     std::lock_guard lock(recycle_tasks_mutex);
     auto& entry = distributed_tasks_[task_name];
     entry.state = DistributedTaskState::LEASING;
     entry.stopped = std::make_shared<std::atomic_bool>(false);
     entry.start_time_seconds =
             duration_cast<seconds>(steady_clock::now().time_since_epoch()).count();
+    entry.ctime_ms = ctime_ms;
     return entry.stopped;
 }
 

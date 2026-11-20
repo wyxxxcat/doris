@@ -359,7 +359,8 @@ public:
         FINISHING,
     };
 
-    std::shared_ptr<std::atomic_bool> add_distributed_task(const std::string& task_name);
+    std::shared_ptr<std::atomic_bool> add_distributed_task(const std::string& task_name,
+                                                           int64_t ctime_ms = 0);
     void stop_distributed_task(const std::string& task_name);
     bool begin_finish_distributed_task(const std::string& task_name);
     bool remove_distributed_task(const std::string& task_name);
@@ -772,6 +773,7 @@ private:
         DistributedTaskState state {DistributedTaskState::LEASING};
         std::shared_ptr<std::atomic_bool> stopped {std::make_shared<std::atomic_bool>(false)};
         int64_t start_time_seconds {0};
+        int64_t ctime_ms {0};
     };
     static inline thread_local const std::atomic_bool* current_task_stopped_ = nullptr;
     std::atomic_bool holds_instance_lock_ {false};

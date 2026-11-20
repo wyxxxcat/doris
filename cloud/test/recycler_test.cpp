@@ -12205,7 +12205,7 @@ TEST(RecyclerTest, distributed_recycle_task_util) {
 
     // Normal finish sets task_b to IDLE and keeps last_ctime_ms for interval check
     finish_instance_recycle_task(txn_kv.get(), key, test_instance_id, "127.0.0.1:5000", "task_b",
-                                 true, /*abort_release=*/false);
+                                 true, ctime_ms, /*abort_release=*/false);
     {
         JobRecyclePB job_pb;
         load_job_pb(&job_pb);
@@ -12226,14 +12226,30 @@ TEST(RecyclerTest, distributed_recycle_task_util) {
 
     // Reclaim task_b when interval_ms elapsed, then abort_release it so Node 2 can claim immediately
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    int64_t reclaim_ctime = 0;
     ASSERT_EQ(prepare_instance_recycle_tasks(txn_kv.get(), key, test_instance_id, "127.0.0.1:5000",
-                                             0, {"task_b"}, &claimed),
+                                             0, {"task_b"}, &claimed, &reclaim_ctime),
               0);
     ASSERT_EQ(claimed.size(), 1);
     EXPECT_EQ(claimed[0], "task_b");
+    EXPECT_GT(reclaim_ctime, ctime_ms);
+
+    // Stale callback with old ctime_ms does not alter the new lease
+    finish_instance_recycle_task(txn_kv.get(), key, test_instance_id, "127.0.0.1:5000", "task_b",
+                                 true, /*ctime_ms=*/ctime_ms, /*abort_release=*/false);
+    {
+        JobRecyclePB job_pb;
+        load_job_pb(&job_pb);
+        for (const auto& task : job_pb.running_task_list()) {
+            if (task.task_name() == "task_b") {
+                EXPECT_EQ(task.status(), JobRecyclePB::BUSY);
+                EXPECT_EQ(task.last_ctime_ms(), reclaim_ctime);
+            }
+        }
+    }
 
     finish_instance_recycle_task(txn_kv.get(), key, test_instance_id, "127.0.0.1:5000", "task_b",
-                                 false, /*abort_release=*/true);
+                                 false, reclaim_ctime, /*abort_release=*/true);
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
     ASSERT_EQ(prepare_instance_recycle_tasks(txn_kv.get(), key, test_instance_id, "127.0.0.2:5000",
                                              60000, {"task_b"}, &claimed),
@@ -12243,11 +12259,11 @@ TEST(RecyclerTest, distributed_recycle_task_util) {
 
     // Release all BUSY tasks and verify whole-instance mode takes over and fences distributed lease
     finish_instance_recycle_task(txn_kv.get(), key, test_instance_id, "127.0.0.9:5000", "task_a",
-                                 false, /*abort_release=*/true);
+                                 false, /*ctime_ms=*/0, /*abort_release=*/true);
     finish_instance_recycle_task(txn_kv.get(), key, test_instance_id, "127.0.0.2:5000", "task_b",
-                                 false, /*abort_release=*/true);
+                                 false, /*ctime_ms=*/0, /*abort_release=*/true);
     finish_instance_recycle_task(txn_kv.get(), key, test_instance_id, "127.0.0.2:5000", "task_c",
-                                 false, /*abort_release=*/true);
+                                 false, /*ctime_ms=*/0, /*abort_release=*/true);
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
 
     ASSERT_EQ(
