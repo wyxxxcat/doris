@@ -712,6 +712,16 @@ message RestoreJobCloudPB {
     optional int64 version = 13;
 }
 
+message TaskRecyclePB {
+    optional string task_name = 1;
+    optional int64 expiration_time_ms = 2;
+    optional int64 last_ctime_ms = 3;
+    optional int64 last_finish_time_ms = 4;
+    optional int64 last_success_time_ms = 5;
+    optional string ip_port = 6;
+    optional JobRecyclePB.Status status = 7;
+}
+
 message JobRecyclePB {
     enum Status {
         IDLE = 0;
@@ -724,6 +734,7 @@ message JobRecyclePB {
     optional int64 last_finish_time_ms = 5;
     optional Status status = 6;
     optional int64 last_success_time_ms = 7;
+    repeated TaskRecyclePB running_task_list = 8;
 }
 
 message TabletIndexPB {

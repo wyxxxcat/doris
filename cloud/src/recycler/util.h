@@ -22,6 +22,8 @@
 #include <glog/logging.h>
 
 #include <string>
+#include <string_view>
+#include <vector>
 
 #include "common/defer.h"
 
@@ -60,6 +62,37 @@ void finish_instance_recycle_job(TxnKv* txn_kv, std::string_view key,
  */
 int lease_instance_recycle_job(TxnKv* txn_kv, std::string_view key, const std::string& instance_id,
                                const std::string& ip_port);
+
+/**
+ * Claim eligible distributed recycle tasks in a single FDB transaction.
+ * @param candidate_tasks tasks not currently running on this node
+ * @param claimed_tasks output task names claimed by this node
+ * @param ctime_ms output claim timestamp in ms
+ * @return 0 if at least one task is claimed, 1 if no task is claimable or instance is BUSY,
+ *         negative on error
+ */
+int prepare_instance_recycle_tasks(TxnKv* txn_kv, std::string_view key,
+                                   const std::string& instance_id, const std::string& ip_port,
+                                   int64_t interval_ms,
+                                   const std::vector<std::string>& candidate_tasks,
+                                   std::vector<std::string>* claimed_tasks, int64_t* ctime_ms);
+
+/**
+ * Finish a single distributed recycle task (or immediately expire it when abort_release is true).
+ */
+void finish_instance_recycle_task(TxnKv* txn_kv, std::string_view key,
+                                  const std::string& instance_id, const std::string& ip_port,
+                                  const std::string& task_name, bool success, int64_t ctime_ms,
+                                  bool abort_release = false);
+
+/**
+ * Renew leases for all distributed tasks currently running on this node for the given instance.
+ * @return 0 for success, 1 if local tasks should be aborted (fenced by instance lock or lease
+ *         lost), negative for other errors
+ */
+int lease_instance_recycle_tasks(TxnKv* txn_kv, std::string_view key,
+                                 const std::string& instance_id, const std::string& ip_port,
+                                 const std::vector<std::string>& running_tasks);
 
 inline std::string segment_path(int64_t tablet_id, const std::string& rowset_id,
                                 int64_t segment_id) {

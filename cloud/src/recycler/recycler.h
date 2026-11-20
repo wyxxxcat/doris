@@ -107,6 +107,8 @@ private:
 
     void check_recycle_tasks();
 
+    void schedule_distributed_tasks(const InstanceInfoPB& instance);
+
 private:
     friend class RecyclerServiceImpl;
 
@@ -300,6 +302,27 @@ public:
 
     // returns 0 for success otherwise error
     int do_recycle();
+
+    struct RecycleTaskDesc {
+        std::string name;
+        std::function<int()> func;
+    };
+    static std::vector<std::string> recycle_task_names();
+    std::vector<RecycleTaskDesc> get_recycle_tasks();
+
+    bool holds_instance_lock() const {
+        return holds_instance_lock_.load(std::memory_order_acquire);
+    }
+    void set_holds_instance_lock(bool val) {
+        holds_instance_lock_.store(val, std::memory_order_release);
+    }
+
+    void add_active_distributed_task(const std::string& task_name);
+    void remove_leasing_distributed_task(const std::string& task_name);
+    bool remove_active_distributed_task(const std::string& task_name);
+    std::vector<std::string> get_active_distributed_tasks();
+    std::vector<std::string> get_leasing_distributed_tasks();
+    std::mutex& task_lease_mutex() { return task_lease_mtx_; }
 
     // remove all kv and data in this instance, ONLY be called when instance has been deleted
     // returns 0 for success otherwise error
@@ -701,6 +724,11 @@ private:
     std::mutex recycle_tasks_mutex;
     // <task_name, start_time>>
     std::map<std::string, int64_t> running_recycle_tasks;
+
+    std::atomic_bool holds_instance_lock_ {false};
+    std::mutex task_lease_mtx_;
+    std::unordered_set<std::string> active_distributed_tasks_;
+    std::unordered_set<std::string> leasing_distributed_tasks_;
 
     RecyclerThreadPoolGroup _thread_pool_group;
 
