@@ -313,8 +313,7 @@ int prepare_instance_recycle_tasks(TxnKv* txn_kv, std::string_view key,
             if (task_pb != nullptr) {
                 bool claimable = task_pb->status() == JobRecyclePB::BUSY
                                          ? (now >= task_pb->expiration_time_ms())
-                                         : (!task_pb->has_last_finish_time_ms() ||
-                                            now - task_pb->last_finish_time_ms() >= interval_ms);
+                                         : (now - task_pb->last_ctime_ms() > interval_ms);
                 if (!claimable) {
                     continue;
                 }
@@ -341,7 +340,9 @@ int prepare_instance_recycle_tasks(TxnKv* txn_kv, std::string_view key,
         err = txn->commit();
         if (err == TxnErrorCode::TXN_OK) {
             *claimed_tasks = std::move(to_claim);
-            *ctime_ms = now;
+            if (ctime_ms != nullptr) {
+                *ctime_ms = now;
+            }
             return 0;
         }
         if (err == TxnErrorCode::TXN_CONFLICT) {
@@ -360,8 +361,7 @@ int prepare_instance_recycle_tasks(TxnKv* txn_kv, std::string_view key,
 
 void finish_instance_recycle_task(TxnKv* txn_kv, std::string_view key,
                                   const std::string& instance_id, const std::string& ip_port,
-                                  const std::string& task_name, bool success, int64_t ctime_ms,
-                                  bool abort_release) {
+                                  const std::string& task_name, bool success, bool abort_release) {
     constexpr int kMaxFinishRetries = 10;
     for (int retry_times = 0; retry_times < kMaxFinishRetries; ++retry_times) {
         std::unique_ptr<Transaction> txn;
@@ -409,7 +409,6 @@ void finish_instance_recycle_task(TxnKv* txn_kv, std::string_view key,
             task_pb->set_expiration_time_ms(now);
         } else {
             task_pb->set_status(JobRecyclePB::IDLE);
-            task_pb->set_last_ctime_ms(ctime_ms);
             task_pb->set_last_finish_time_ms(now);
             if (success) {
                 task_pb->set_last_success_time_ms(now);
@@ -441,7 +440,11 @@ void finish_instance_recycle_task(TxnKv* txn_kv, std::string_view key,
 
 int lease_instance_recycle_tasks(TxnKv* txn_kv, std::string_view key,
                                  const std::string& instance_id, const std::string& ip_port,
-                                 const std::vector<std::string>& running_tasks) {
+                                 const std::vector<std::string>& running_tasks,
+                                 std::vector<std::string>* failed_tasks) {
+    if (failed_tasks != nullptr) {
+        failed_tasks->clear();
+    }
     if (running_tasks.empty()) {
         return 0;
     }
@@ -485,36 +488,53 @@ int lease_instance_recycle_tasks(TxnKv* txn_kv, std::string_view key,
 
         using namespace std::chrono;
         auto now = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+        std::vector<std::string> current_failed_tasks;
+        bool any_renewed = false;
         for (const auto& task_name : running_tasks) {
             TaskRecyclePB* task_pb = find_task_in_pb(&job_info, task_name);
             if (task_pb == nullptr) {
                 LOG(WARNING) << "distributed recycle task not found when leasing, task="
                              << task_name << " key=" << hex(key);
-                return 1;
+                current_failed_tasks.push_back(task_name);
+                continue;
             }
             if (task_pb->ip_port() != ip_port) {
                 LOG(WARNING) << "distributed recycle task is doing at other machine: "
                              << task_pb->ip_port() << " task=" << task_name << " key=" << hex(key);
-                return 1;
+                current_failed_tasks.push_back(task_name);
+                continue;
             }
             if (task_pb->status() != JobRecyclePB::BUSY) {
                 LOG(WARNING) << "distributed recycle task is not busy, task=" << task_name
                              << " key=" << hex(key);
-                return 1;
+                current_failed_tasks.push_back(task_name);
+                continue;
             }
             if (now >= task_pb->expiration_time_ms()) {
                 LOG(WARNING) << "distributed recycle task lease expired, task=" << task_name
                              << " now=" << now << " expiration=" << task_pb->expiration_time_ms()
                              << " key=" << hex(key);
-                return 1;
+                current_failed_tasks.push_back(task_name);
+                continue;
             }
             task_pb->set_expiration_time_ms(now + config::recycle_job_lease_expired_ms);
+            any_renewed = true;
+        }
+
+        if (!any_renewed) {
+            if (failed_tasks != nullptr) {
+                *failed_tasks = std::move(current_failed_tasks);
+            }
+            return 0;
         }
 
         val = job_info.SerializeAsString();
         txn->put(key, val);
         err = txn->commit();
         if (err == TxnErrorCode::TXN_OK) {
+            if (failed_tasks != nullptr) {
+                *failed_tasks = std::move(current_failed_tasks);
+            }
             return 0;
         }
         if (err == TxnErrorCode::TXN_CONFLICT) {

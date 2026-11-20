@@ -12100,4 +12100,292 @@ TEST(RecyclerTest, delete_versioned_delete_bitmap_by_rowset) {
     }
 }
 
+TEST(RecyclerTest, distributed_recycle_task_util) {
+    auto old_lease_ms = config::recycle_job_lease_expired_ms;
+    config::recycle_job_lease_expired_ms = 5000;
+    DORIS_CLOUD_DEFER {
+        config::recycle_job_lease_expired_ms = old_lease_ms;
+    };
+
+    auto txn_kv = std::make_shared<MemTxnKv>();
+    ASSERT_EQ(txn_kv->init(), 0);
+
+    const std::string test_instance_id = "distributed_util_instance";
+    std::string key;
+    job_recycle_key({test_instance_id}, &key);
+
+    auto load_job_pb = [&](JobRecyclePB* job_pb) {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+        std::string val;
+        ASSERT_EQ(txn->get(key, &val), TxnErrorCode::TXN_OK);
+        ASSERT_TRUE(job_pb->ParseFromString(val));
+    };
+
+    // Node 1 claims task_a and task_b
+    std::vector<std::string> claimed;
+    int64_t ctime_ms = 0;
+    ASSERT_EQ(prepare_instance_recycle_tasks(txn_kv.get(), key, test_instance_id, "127.0.0.1:5000",
+                                             60000, {"task_a", "task_b"}, &claimed, &ctime_ms),
+              0);
+    ASSERT_EQ(claimed.size(), 2);
+    EXPECT_EQ(claimed[0], "task_a");
+    EXPECT_EQ(claimed[1], "task_b");
+    EXPECT_GT(ctime_ms, 0);
+
+    {
+        JobRecyclePB job_pb;
+        load_job_pb(&job_pb);
+        EXPECT_EQ(job_pb.status(), JobRecyclePB::IDLE);
+        ASSERT_EQ(job_pb.running_task_list_size(), 2);
+        for (const auto& task : job_pb.running_task_list()) {
+            EXPECT_EQ(task.status(), JobRecyclePB::BUSY);
+            EXPECT_EQ(task.ip_port(), "127.0.0.1:5000");
+            EXPECT_EQ(task.last_ctime_ms(), ctime_ms);
+        }
+    }
+
+    // Node 2 can claim unclaimed task_c, but not busy task_a/task_b
+    ASSERT_EQ(prepare_instance_recycle_tasks(txn_kv.get(), key, test_instance_id, "127.0.0.2:5000",
+                                             60000, {"task_a", "task_b", "task_c"}, &claimed),
+              0);
+    ASSERT_EQ(claimed.size(), 1);
+    EXPECT_EQ(claimed[0], "task_c");
+
+    // Whole-instance mode is blocked while distributed tasks are active
+    EXPECT_EQ(
+            prepare_instance_recycle_job(txn_kv.get(), key, test_instance_id, "127.0.0.3:5000", 0),
+            1);
+
+    // Simulate task_a stolen by another node while task_b stays healthy on Node 1
+    int64_t task_b_old_exp = 0;
+    {
+        std::unique_ptr<Transaction> txn;
+        ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+        std::string val;
+        ASSERT_EQ(txn->get(key, &val), TxnErrorCode::TXN_OK);
+        JobRecyclePB job_pb;
+        ASSERT_TRUE(job_pb.ParseFromString(val));
+        for (int i = 0; i < job_pb.running_task_list_size(); ++i) {
+            auto* task = job_pb.mutable_running_task_list(i);
+            if (task->task_name() == "task_a") {
+                task->set_ip_port("127.0.0.9:5000");
+            } else if (task->task_name() == "task_b") {
+                task_b_old_exp = task->expiration_time_ms();
+            }
+        }
+        txn->put(key, job_pb.SerializeAsString());
+        ASSERT_EQ(txn->commit(), TxnErrorCode::TXN_OK);
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+    // Partial lease failure: task_b is still renewed while task_a & missing_task are reported
+    std::vector<std::string> failed_tasks;
+    ASSERT_EQ(lease_instance_recycle_tasks(txn_kv.get(), key, test_instance_id, "127.0.0.1:5000",
+                                           {"task_a", "task_b", "missing_task"}, &failed_tasks),
+              0);
+    std::unordered_set<std::string> failed_set(failed_tasks.begin(), failed_tasks.end());
+    EXPECT_EQ(failed_set.size(), 2);
+    EXPECT_TRUE(failed_set.contains("task_a"));
+    EXPECT_TRUE(failed_set.contains("missing_task"));
+    EXPECT_FALSE(failed_set.contains("task_b"));
+    {
+        JobRecyclePB job_pb;
+        load_job_pb(&job_pb);
+        bool checked_b = false;
+        for (const auto& task : job_pb.running_task_list()) {
+            if (task.task_name() == "task_b") {
+                EXPECT_GT(task.expiration_time_ms(), task_b_old_exp);
+                checked_b = true;
+            }
+        }
+        EXPECT_TRUE(checked_b);
+    }
+
+    // Normal finish sets task_b to IDLE and keeps last_ctime_ms for interval check
+    finish_instance_recycle_task(txn_kv.get(), key, test_instance_id, "127.0.0.1:5000", "task_b",
+                                 true, /*abort_release=*/false);
+    {
+        JobRecyclePB job_pb;
+        load_job_pb(&job_pb);
+        for (const auto& task : job_pb.running_task_list()) {
+            if (task.task_name() == "task_b") {
+                EXPECT_EQ(task.status(), JobRecyclePB::IDLE);
+                EXPECT_EQ(task.last_ctime_ms(), ctime_ms);
+                EXPECT_GT(task.last_finish_time_ms(), 0);
+                EXPECT_GT(task.last_success_time_ms(), 0);
+            }
+        }
+    }
+
+    // Cannot reclaim task_b within interval_ms
+    EXPECT_EQ(prepare_instance_recycle_tasks(txn_kv.get(), key, test_instance_id, "127.0.0.1:5000",
+                                             60000, {"task_b"}, &claimed),
+              1);
+
+    // Reclaim task_b when interval_ms elapsed, then abort_release it so Node 2 can claim immediately
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    ASSERT_EQ(prepare_instance_recycle_tasks(txn_kv.get(), key, test_instance_id, "127.0.0.1:5000",
+                                             0, {"task_b"}, &claimed),
+              0);
+    ASSERT_EQ(claimed.size(), 1);
+    EXPECT_EQ(claimed[0], "task_b");
+
+    finish_instance_recycle_task(txn_kv.get(), key, test_instance_id, "127.0.0.1:5000", "task_b",
+                                 false, /*abort_release=*/true);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    ASSERT_EQ(prepare_instance_recycle_tasks(txn_kv.get(), key, test_instance_id, "127.0.0.2:5000",
+                                             60000, {"task_b"}, &claimed),
+              0);
+    ASSERT_EQ(claimed.size(), 1);
+    EXPECT_EQ(claimed[0], "task_b");
+
+    // Release all BUSY tasks and verify whole-instance mode takes over and fences distributed lease
+    finish_instance_recycle_task(txn_kv.get(), key, test_instance_id, "127.0.0.9:5000", "task_a",
+                                 false, /*abort_release=*/true);
+    finish_instance_recycle_task(txn_kv.get(), key, test_instance_id, "127.0.0.2:5000", "task_b",
+                                 false, /*abort_release=*/true);
+    finish_instance_recycle_task(txn_kv.get(), key, test_instance_id, "127.0.0.2:5000", "task_c",
+                                 false, /*abort_release=*/true);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+
+    ASSERT_EQ(
+            prepare_instance_recycle_job(txn_kv.get(), key, test_instance_id, "127.0.0.3:5000", 0),
+            0);
+    {
+        JobRecyclePB job_pb;
+        load_job_pb(&job_pb);
+        EXPECT_EQ(job_pb.status(), JobRecyclePB::BUSY);
+        EXPECT_EQ(job_pb.running_task_list_size(), 0);
+    }
+    EXPECT_EQ(prepare_instance_recycle_tasks(txn_kv.get(), key, test_instance_id, "127.0.0.2:5000",
+                                             0, {"task_b"}, &claimed),
+              1);
+    EXPECT_EQ(lease_instance_recycle_tasks(txn_kv.get(), key, test_instance_id, "127.0.0.2:5000",
+                                           {"task_b"}, &failed_tasks),
+              1);
+
+    auto whole_ctime = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+    finish_instance_recycle_job(txn_kv.get(), key, test_instance_id, "127.0.0.3:5000", true,
+                                whole_ctime);
+}
+
+TEST(RecyclerTest, schedule_distributed_tasks_and_per_task_lease_stop) {
+    auto old_dist = config::enable_distributed_recycler_task;
+    auto old_interval = config::recycle_interval_seconds;
+    auto old_lease_ms = config::recycle_job_lease_expired_ms;
+    config::enable_distributed_recycler_task = true;
+    config::recycle_interval_seconds = 60;
+    config::recycle_job_lease_expired_ms = 60000;
+    DORIS_CLOUD_DEFER {
+        config::enable_distributed_recycler_task = old_dist;
+        config::recycle_interval_seconds = old_interval;
+        config::recycle_job_lease_expired_ms = old_lease_ms;
+    };
+
+    auto txn_kv = std::make_shared<MemTxnKv>();
+    ASSERT_EQ(txn_kv->init(), 0);
+
+    InstanceInfoPB instance;
+    instance.set_instance_id("dist_test_instance");
+    instance.set_status(InstanceInfoPB::NORMAL);
+    auto* obj_info = instance.add_obj_info();
+    obj_info->set_id("dist_test_obj");
+    obj_info->set_ak(config::test_s3_ak);
+    obj_info->set_sk(config::test_s3_sk);
+    obj_info->set_endpoint(config::test_s3_endpoint);
+    obj_info->set_region(config::test_s3_region);
+    obj_info->set_bucket(config::test_s3_bucket);
+    obj_info->set_prefix("dist_test_prefix");
+
+    // 1. Verify static task registry and per-task stop token isolation on InstanceRecycler
+    const auto& names1 = InstanceRecycler::recycle_task_names();
+    const auto& names2 = InstanceRecycler::recycle_task_names();
+    EXPECT_EQ(&names1, &names2);
+    EXPECT_FALSE(names1.empty());
+
+    {
+        InstanceRecycler inst_recycler(txn_kv, instance, thread_group,
+                                       std::make_shared<TxnLazyCommitter>(txn_kv));
+        ASSERT_EQ(inst_recycler.init(), 0);
+        for (const auto& name : names1) {
+            EXPECT_TRUE(static_cast<bool>(inst_recycler.get_recycle_task(name)));
+        }
+
+        auto token_a = inst_recycler.add_distributed_task("task_a");
+        auto token_b = inst_recycler.add_distributed_task("task_b");
+        EXPECT_EQ(inst_recycler.get_active_distributed_tasks().size(), 2);
+        EXPECT_EQ(inst_recycler.get_leasing_distributed_tasks().size(), 2);
+
+        inst_recycler.stop_distributed_task("task_a");
+        auto leasing = inst_recycler.get_leasing_distributed_tasks();
+        ASSERT_EQ(leasing.size(), 1);
+        EXPECT_EQ(leasing[0], "task_b");
+        EXPECT_EQ(inst_recycler.get_active_distributed_tasks().size(), 2);
+
+        EXPECT_FALSE(inst_recycler.stopped());
+        {
+            InstanceRecycler::ScopedTaskStopToken scope_a(token_a.get());
+            EXPECT_TRUE(inst_recycler.stopped());
+        }
+        {
+            InstanceRecycler::ScopedTaskStopToken scope_b(token_b.get());
+            EXPECT_FALSE(inst_recycler.stopped());
+        }
+        EXPECT_FALSE(inst_recycler.begin_finish_distributed_task("task_a"));
+        EXPECT_TRUE(inst_recycler.begin_finish_distributed_task("task_b"));
+        EXPECT_TRUE(inst_recycler.get_leasing_distributed_tasks().empty());
+
+        EXPECT_FALSE(inst_recycler.remove_distributed_task("task_a"));
+        EXPECT_TRUE(inst_recycler.remove_distributed_task("task_b"));
+
+        auto token_c = inst_recycler.add_distributed_task("task_c");
+        inst_recycler.stop();
+        {
+            InstanceRecycler::ScopedTaskStopToken scope_c(token_c.get());
+            EXPECT_TRUE(inst_recycler.stopped());
+        }
+    }
+
+    // 2. Verify Recycler::schedule_distributed_tasks executes all tasks and finishes in FDB
+    Recycler recycler(txn_kv);
+    recycler.ip_port_ = "127.0.0.1:5100";
+    recycler.schedule_distributed_tasks(instance);
+
+    bool all_finished = false;
+    for (int i = 0; i < 1000; ++i) {
+        {
+            std::lock_guard lock(recycler.mtx_);
+            if (recycler.recycling_instance_map_.empty()) {
+                all_finished = true;
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(all_finished);
+    recycler.stop();
+
+    std::string recycle_job_key;
+    job_recycle_key({instance.instance_id()}, &recycle_job_key);
+    std::unique_ptr<Transaction> txn;
+    ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+    std::string val;
+    ASSERT_EQ(txn->get(recycle_job_key, &val), TxnErrorCode::TXN_OK);
+    JobRecyclePB job_pb;
+    ASSERT_TRUE(job_pb.ParseFromString(val));
+    EXPECT_EQ(job_pb.status(), JobRecyclePB::IDLE);
+    EXPECT_EQ(job_pb.running_task_list_size(), names1.size());
+    for (const auto& task : job_pb.running_task_list()) {
+        EXPECT_EQ(task.status(), JobRecyclePB::IDLE) << task.task_name();
+        EXPECT_EQ(task.ip_port(), "127.0.0.1:5100") << task.task_name();
+        EXPECT_GT(task.last_ctime_ms(), 0) << task.task_name();
+        EXPECT_GT(task.last_finish_time_ms(), 0) << task.task_name();
+        EXPECT_GT(task.last_success_time_ms(), 0) << task.task_name();
+    }
+}
+
 } // namespace doris::cloud

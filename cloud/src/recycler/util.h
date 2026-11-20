@@ -67,7 +67,7 @@ int lease_instance_recycle_job(TxnKv* txn_kv, std::string_view key, const std::s
  * Claim eligible distributed recycle tasks in a single FDB transaction.
  * @param candidate_tasks tasks not currently running on this node
  * @param claimed_tasks output task names claimed by this node
- * @param ctime_ms output claim timestamp in ms
+ * @param ctime_ms optional output claim timestamp in ms
  * @return 0 if at least one task is claimed, 1 if no task is claimable or instance is BUSY,
  *         negative on error
  */
@@ -75,24 +75,29 @@ int prepare_instance_recycle_tasks(TxnKv* txn_kv, std::string_view key,
                                    const std::string& instance_id, const std::string& ip_port,
                                    int64_t interval_ms,
                                    const std::vector<std::string>& candidate_tasks,
-                                   std::vector<std::string>* claimed_tasks, int64_t* ctime_ms);
+                                   std::vector<std::string>* claimed_tasks,
+                                   int64_t* ctime_ms = nullptr);
 
 /**
  * Finish a single distributed recycle task (or immediately expire it when abort_release is true).
  */
 void finish_instance_recycle_task(TxnKv* txn_kv, std::string_view key,
                                   const std::string& instance_id, const std::string& ip_port,
-                                  const std::string& task_name, bool success, int64_t ctime_ms,
+                                  const std::string& task_name, bool success,
                                   bool abort_release = false);
 
 /**
- * Renew leases for all distributed tasks currently running on this node for the given instance.
- * @return 0 for success, 1 if local tasks should be aborted (fenced by instance lock or lease
- *         lost), negative for other errors
+ * Renew leases for distributed tasks currently running on this node for the given instance.
+ * Healthy tasks have their leases renewed even if some other tasks in running_tasks lost their
+ * leases; tasks that lost their lease or expired are output in failed_tasks.
+ * @return 0 for success (caller should stop any tasks in failed_tasks),
+ *         1 if all local tasks should be aborted (fenced by instance lock or key missing),
+ *         negative for other errors
  */
 int lease_instance_recycle_tasks(TxnKv* txn_kv, std::string_view key,
                                  const std::string& instance_id, const std::string& ip_port,
-                                 const std::vector<std::string>& running_tasks);
+                                 const std::vector<std::string>& running_tasks,
+                                 std::vector<std::string>* failed_tasks = nullptr);
 
 inline std::string segment_path(int64_t tablet_id, const std::string& rowset_id,
                                 int64_t segment_id) {

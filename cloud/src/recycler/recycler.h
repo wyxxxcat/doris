@@ -297,8 +297,43 @@ public:
     // returns 0 for success otherwise error
     int init();
 
-    void stop() { stopped_.store(true, std::memory_order_release); }
-    bool stopped() const { return stopped_.load(std::memory_order_acquire); }
+    class ScopedTaskStopToken {
+    public:
+        explicit ScopedTaskStopToken(const std::atomic_bool* token) : prev_(current_task_stopped_) {
+            current_task_stopped_ = token;
+        }
+        ~ScopedTaskStopToken() { current_task_stopped_ = prev_; }
+        ScopedTaskStopToken(const ScopedTaskStopToken&) = delete;
+        ScopedTaskStopToken& operator=(const ScopedTaskStopToken&) = delete;
+
+    private:
+        const std::atomic_bool* prev_;
+    };
+
+    static const std::atomic_bool* current_task_stop_token() { return current_task_stopped_; }
+
+    void stop() {
+        stopped_.store(true, std::memory_order_release);
+        std::lock_guard lock(recycle_tasks_mutex);
+        for (auto& [_, entry] : distributed_tasks_) {
+            entry.state = DistributedTaskState::STOPPED;
+            entry.stopped->store(true, std::memory_order_release);
+        }
+    }
+    bool stopped() const {
+        return stopped_.load(std::memory_order_acquire) ||
+               (current_task_stopped_ != nullptr &&
+                current_task_stopped_->load(std::memory_order_acquire));
+    }
+
+    void reset_metrics() {
+        tablet_metrics_context_.reset();
+        segment_metrics_context_.reset();
+    }
+    void finish_report_metrics() {
+        tablet_metrics_context_.finish_report();
+        segment_metrics_context_.finish_report();
+    }
 
     // returns 0 for success otherwise error
     int do_recycle();
@@ -307,8 +342,9 @@ public:
         std::string name;
         std::function<int()> func;
     };
-    static std::vector<std::string> recycle_task_names();
+    static const std::vector<std::string>& recycle_task_names();
     std::vector<RecycleTaskDesc> get_recycle_tasks();
+    std::function<int()> get_recycle_task(std::string_view task_name);
 
     bool holds_instance_lock() const {
         return holds_instance_lock_.load(std::memory_order_acquire);
@@ -317,9 +353,16 @@ public:
         holds_instance_lock_.store(val, std::memory_order_release);
     }
 
-    void add_active_distributed_task(const std::string& task_name);
-    void remove_leasing_distributed_task(const std::string& task_name);
-    bool remove_active_distributed_task(const std::string& task_name);
+    enum class DistributedTaskState {
+        LEASING,
+        STOPPED,
+        FINISHING,
+    };
+
+    std::shared_ptr<std::atomic_bool> add_distributed_task(const std::string& task_name);
+    void stop_distributed_task(const std::string& task_name);
+    bool begin_finish_distributed_task(const std::string& task_name);
+    bool remove_distributed_task(const std::string& task_name);
     std::vector<std::string> get_active_distributed_tasks();
     std::vector<std::string> get_leasing_distributed_tasks();
     std::mutex& task_lease_mutex() { return task_lease_mtx_; }
@@ -725,10 +768,15 @@ private:
     // <task_name, start_time>>
     std::map<std::string, int64_t> running_recycle_tasks;
 
+    struct DistributedTaskEntry {
+        DistributedTaskState state {DistributedTaskState::LEASING};
+        std::shared_ptr<std::atomic_bool> stopped {std::make_shared<std::atomic_bool>(false)};
+        int64_t start_time_seconds {0};
+    };
+    static inline thread_local const std::atomic_bool* current_task_stopped_ = nullptr;
     std::atomic_bool holds_instance_lock_ {false};
     std::mutex task_lease_mtx_;
-    std::unordered_set<std::string> active_distributed_tasks_;
-    std::unordered_set<std::string> leasing_distributed_tasks_;
+    std::unordered_map<std::string, DistributedTaskEntry> distributed_tasks_;
 
     RecyclerThreadPoolGroup _thread_pool_group;
 
