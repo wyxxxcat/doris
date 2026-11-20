@@ -162,9 +162,6 @@ public:
 
     ~RecyclerMetricsContext() = default;
 
-    std::atomic_ullong total_need_recycle_data_size = 0;
-    std::atomic_ullong total_need_recycle_num = 0;
-
     std::atomic_ullong total_recycled_data_size = 0;
     std::atomic_ullong total_recycled_num = 0;
 
@@ -187,8 +184,6 @@ public:
     }
 
     void reset() {
-        total_need_recycle_data_size = 0;
-        total_need_recycle_num = 0;
         total_recycled_data_size = 0;
         total_recycled_num = 0;
         start_time = duration_cast<std::chrono::milliseconds>(
@@ -223,22 +218,12 @@ public:
     }
 
     // `is_begin` is used to initialize total num of items need to be recycled
-    void report(bool is_begin = false) {
+    void report() {
         if (!operation_type.empty()) {
-            // is init
-            if (is_begin) {
-                auto value = total_need_recycle_num.load();
-
-                g_bvar_recycler_instance_last_round_to_recycle_bytes.put(
-                        {instance_id, operation_type}, total_need_recycle_data_size.load());
-                g_bvar_recycler_instance_last_round_to_recycle_num.put(
-                        {instance_id, operation_type}, value);
-            } else {
-                g_bvar_recycler_instance_last_round_recycled_bytes.put(
-                        {instance_id, operation_type}, total_recycled_data_size.load());
-                g_bvar_recycler_instance_last_round_recycled_num.put({instance_id, operation_type},
-                                                                     total_recycled_num.load());
-            }
+            g_bvar_recycler_instance_last_round_recycled_bytes.put({instance_id, operation_type},
+                                                                   total_recycled_data_size.load());
+            g_bvar_recycler_instance_last_round_recycled_num.put({instance_id, operation_type},
+                                                                 total_recycled_num.load());
         }
     }
 };
@@ -412,30 +397,6 @@ public:
     int recycle_ref_rowsets(bool* has_unrecycled_rowsets);
 
     bool check_recycle_tasks();
-
-    int scan_and_statistics_indexes();
-
-    int scan_and_statistics_partitions();
-
-    int scan_and_statistics_rowsets();
-
-    int scan_and_statistics_tmp_rowsets();
-
-    int scan_and_statistics_abort_timeout_txn();
-
-    int scan_and_statistics_expired_txn_label();
-
-    int scan_and_statistics_copy_jobs();
-
-    int scan_and_statistics_stage();
-
-    int scan_and_statistics_expired_stage_objects();
-
-    int scan_and_statistics_versions();
-
-    int scan_and_statistics_restore_jobs();
-
-    void scan_and_statistics_operation_logs();
 
     /**
      * Decode the key of a packed-file metadata record into the persisted object path.

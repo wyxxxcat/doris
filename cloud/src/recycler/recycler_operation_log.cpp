@@ -819,9 +819,6 @@ int InstanceRecycler::recycle_operation_logs() {
         OperationLogReferenceInfo reference_info;
         if (recycle_checker.can_recycle(log_versionstamp, operation_log.min_timestamp(),
                                         &reference_info)) {
-            metrics_context.total_need_recycle_num++;
-            metrics_context.total_need_recycle_data_size += value_size;
-
             AnnotateTag tag("log_key", hex(key));
             int res = recycle_operation_log(log_versionstamp, raw_keys, std::move(operation_log),
                                             &oplog_stats);
