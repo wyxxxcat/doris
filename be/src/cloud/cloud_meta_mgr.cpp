@@ -1009,6 +1009,8 @@ Status CloudMetaMgr::sync_tablet_rowsets_unlocked(CloudTablet* tablet,
 
             tablet->last_base_compaction_success_time_ms = stats.last_base_compaction_time_ms();
             tablet->last_cumu_compaction_success_time_ms = stats.last_cumu_compaction_time_ms();
+            tablet->set_last_base_compaction_success_time(stats.last_base_compaction_time_ms());
+            tablet->set_last_cumu_compaction_success_time(stats.last_cumu_compaction_time_ms());
             tablet->set_base_compaction_cnt(stats.base_compaction_cnt());
             tablet->set_cumulative_compaction_cnt(stats.cumulative_compaction_cnt());
             tablet->set_full_compaction_cnt(stats.full_compaction_cnt());
